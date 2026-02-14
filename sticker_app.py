@@ -5,6 +5,7 @@ import io
 import math
 import pickle
 import sys
+import urllib.request
 from dataclasses import dataclass, field
 
 from PIL import Image
@@ -447,10 +448,6 @@ class PageWidget(QWidget):
 
     # --- Drag and drop ---
 
-    def dragEnterEvent(self, event):
-        if event.mimeData().hasImage() or event.mimeData().hasUrls():
-            event.acceptProposedAction()
-
     def dragMoveEvent(self, event):
         event.acceptProposedAction()
 
@@ -460,20 +457,47 @@ class PageWidget(QWidget):
         if mime.hasUrls():
             for url in mime.urls():
                 path = url.toLocalFile()
-                if path and self._load_file(path):
-                    added = True
+                if path:
+                    if self._load_file(path):
+                        added = True
+                elif url.scheme() in ("http", "https"):
+                    if self._load_url(url.toString()):
+                        added = True
         elif mime.hasImage():
             qimg = QImage(mime.imageData())
             if not qimg.isNull():
                 self._add_qimage(qimg)
                 added = True
+        elif mime.hasText():
+            text = mime.text().strip()
+            if text.startswith(("http://", "https://")):
+                if self._load_url(text):
+                    added = True
         if added:
             self.images_changed.emit()
         event.acceptProposedAction()
 
+    def dragEnterEvent(self, event):
+        mime = event.mimeData()
+        if mime.hasImage() or mime.hasUrls() or mime.hasText():
+            event.acceptProposedAction()
+
     def _load_file(self, path: str) -> bool:
         try:
             img = Image.open(path)
+            img.load()
+            self._add_pil(img)
+            return True
+        except Exception:
+            return False
+
+    def _load_url(self, url: str) -> bool:
+        """Download an image from a URL and add it to the project."""
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "StickerSheet/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = resp.read(10 * 1024 * 1024)  # 10 MB limit
+            img = Image.open(io.BytesIO(data))
             img.load()
             self._add_pil(img)
             return True
