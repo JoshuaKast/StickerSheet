@@ -27,10 +27,25 @@ if [ ! -f icons/StickerSheet.png ]; then
     mv StickerDoc.png icons/
 fi
 
-# Check for .icns files (require macOS iconutil)
+# Convert PNGs to .icns if needed (requires macOS sips + iconutil)
+for icon_name in StickerSheet StickerDoc; do
+    if [ ! -f "icons/${icon_name}.icns" ] && [ -f "icons/${icon_name}.png" ]; then
+        echo "Converting icons/${icon_name}.png -> icons/${icon_name}.icns ..."
+        iconset_dir="icons/${icon_name}.iconset"
+        mkdir -p "$iconset_dir"
+        for size in 16 32 64 128 256 512; do
+            sips -z $size $size "icons/${icon_name}.png" --out "${iconset_dir}/icon_${size}x${size}.png" >/dev/null
+            sips -z $((size*2)) $((size*2)) "icons/${icon_name}.png" --out "${iconset_dir}/icon_${size}x${size}@2x.png" >/dev/null
+        done
+        iconutil -c icns "$iconset_dir" -o "icons/${icon_name}.icns"
+        rm -rf "$iconset_dir"
+        echo "  Created icons/${icon_name}.icns"
+    fi
+done
+
 if [ ! -f icons/StickerSheet.icns ]; then
-    echo "WARNING: icons/StickerSheet.icns not found."
-    echo "Run the iconutil commands from icons/README.md to create .icns files."
+    echo "WARNING: icons/StickerSheet.icns not found and could not be generated."
+    echo "Ensure icons/StickerSheet.png exists, or see icons/README.md."
     echo "Continuing build without custom icons..."
 fi
 
