@@ -4,7 +4,7 @@ A PySide6 desktop app for tiling pasted images onto a US Letter page for printin
 
 ## Concept
 
-The user browses image sources (DuckDuckGo Images, etc.) in a browser, copies images to the clipboard, and pastes them into this app. The app automatically tiles all pasted images onto a printable US Letter page, optimizing layout with optional rotation. Cut lines are drawn around each image. The user prints the result onto sticker paper and cuts them out.
+The user browses image sources (DuckDuckGo Images, etc.) in a browser, copies images to the clipboard, and pastes them into this app. The app automatically tiles all pasted images onto a printable US Letter page, optimizing layout with optional rotation. Empty gaps ("streets") between images provide straight cutting paths. The user prints the result onto sticker paper and cuts them out.
 
 ## Tech Stack
 
@@ -31,7 +31,7 @@ Single-file to start (`sticker_app.py`), split only when complexity demands it.
 - Print DPI: 300 (for high-quality output)
 - Page pixels at 300 DPI: 2550 x 3300
 - Margins: 0.25 inch (75px at 300 DPI) on all sides — keeps images away from unprintable edges
-- Cut-line gap: ~4px at 300 DPI between images (visible dashed line for cutting guide)
+- Cut-line gap: ~4px at 300 DPI between images (empty space — "streets" for cutting, not visibly drawn)
 
 ### Layout Algorithm
 
@@ -68,8 +68,10 @@ This approach may or may not use `rectpack` — it might be simpler to implement
 
 #### Cut line goals
 
-- **Horizontal cuts span the full page width** (between rows) — fewest cuts, longest straight lines
-- **Vertical cuts are per-row** — within a row, images are separated by vertical cut lines
+Cut lines are not visibly drawn — they're just empty gaps ("streets") between images where you cut. The layout creates straight cutting paths:
+
+- **Horizontal streets span the full page width** (between rows) — fewest cuts, longest straight lines
+- **Vertical streets are per-row** — within a row, images are separated by vertical gaps
 - Result: a grid-like structure where each row has uniform height, easy to cut with a paper cutter
 
 ## Roadmap
@@ -83,6 +85,7 @@ This approach may or may not use `rectpack` — it might be simpler to implement
 ### Phase 2: Paste & Display
 - [x] Handle Cmd+V / clipboard paste: extract image from clipboard (QClipboard.image())
 - [x] Also handle drag-and-drop of image files onto the window
+- [ ] Handle drag-and-drop of image URLs (some browsers supply a URL instead of image data) — detect URL mime type and download the image
 - [x] Store pasted images in StickerProject as PNG byte blobs (normalize all formats to PNG via Pillow)
 - [x] Display pasted images in a simple grid on the page (temporary, before real packing)
 
@@ -92,11 +95,11 @@ This approach may or may not use `rectpack` — it might be simpler to implement
 - [x] Implement row packing: fill rows left-to-right, stack rows top-to-bottom
 - [x] Implement scale-to-fit: if rows overflow the page, uniformly shrink all bin heights and repack (binary search)
 - [x] On every paste/delete, re-run layout and update PageWidget
-- [x] Draw cut lines: full-width horizontal lines between rows, vertical lines between images within a row
+- [x] Layout includes cut-line gaps (empty streets) between rows and between images within rows
 - [x] Evaluate whether `rectpack` adds value over the row-based approach; use it or drop the dependency
 
 ### Phase 4: Print
-- [ ] File > Print: open QPrintDialog, render the page at 300 DPI via QPainter onto QPrinter
+- [ ] File > Print: open QPrintDialog, render the page at 300 DPI via QPainter onto QPrinter (system print dialog provides Print-to-PDF for free)
 - [ ] Ensure WYSIWYG: same layout logic for screen and print, just different DPI
 - [ ] Test with actual sticker paper
 
@@ -118,7 +121,11 @@ This approach may or may not use `rectpack` — it might be simpler to implement
 - [ ] Multiple pages (if images overflow one page, add a second)
 - [ ] Manual image reordering / pinning (lock an image's position)
 - [ ] Adjustable margins and cut-line style in preferences
-- [ ] Export to PDF instead of printing
+- [ ] Global hotkey to capture image under mouse cursor from browser — ideas:
+  - **AppleScript + screencapture**: Register a global hotkey (e.g. via PyObjC or a small Swift helper), use AppleScript to get the frontmost browser's current URL or run JavaScript to find the image element under the cursor, then download it. Fragile but zero browser extension needed.
+  - **Accessibility API approach**: Use macOS Accessibility APIs (via PyObjC) to inspect the browser's DOM/AX tree for the image element under the cursor and extract its URL.
+  - **PySide6 embedded QWebEngineView**: Ship a built-in mini-browser inside the app. User browses in-app; on click or hotkey, the app intercepts the image directly from the web engine. Full control, no AppleScript, but adds QtWebEngine as a heavy dependency.
+  - **System-wide drag target**: Keep the app as a floating always-on-top thumbnail/dock. User drags images from any browser onto it. Already partially works via drag-and-drop; this just makes the drop target more accessible.
 
 ## Dev Commands
 
@@ -154,4 +161,4 @@ Stickers/
 - **rectpack as optional**: We keep it in requirements as a fallback, but the row-based approach may be all we need. Will evaluate in Phase 3.
 - **Scale-to-fit strategy**: Rather than rejecting images that don't fit, uniformly scale ALL bin heights down until the layout fits the page. Paste and it just works.
 - **300 DPI internal**: All layout math happens in 300 DPI pixel space. The screen view scales down for display. Print renders at native resolution. One coordinate system, no conversion bugs.
-- **Cut lines are structural**: Horizontal cuts span full page width between rows. Vertical cuts separate images within a row. The layout is designed around cuttability, not just space efficiency.
+- **Cut lines are invisible streets**: Gaps between images are empty space where you cut — no visible lines are drawn. Horizontal gaps span full page width between rows; vertical gaps separate images within a row. The layout is designed around cuttability, not just space efficiency.
