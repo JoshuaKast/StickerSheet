@@ -85,7 +85,7 @@ Cut lines are not visibly drawn — they're just empty gaps ("streets") between 
 ### Phase 2: Paste & Display
 - [x] Handle Cmd+V / clipboard paste: extract image from clipboard (QClipboard.image())
 - [x] Also handle drag-and-drop of image files onto the window
-- [ ] Handle drag-and-drop of image URLs (some browsers supply a URL instead of image data) — detect URL mime type and download the image
+- [x] Handle drag-and-drop of image URLs (some browsers supply a URL instead of image data) — detect URL mime type and download the image
 - [x] Store pasted images in StickerProject as PNG byte blobs (normalize all formats to PNG via Pillow)
 - [x] Display pasted images in a simple grid on the page (temporary, before real packing)
 
@@ -101,7 +101,7 @@ Cut lines are not visibly drawn — they're just empty gaps ("streets") between 
 ### Phase 4: Print
 - [x] File > Print: open QPrintDialog, render the page at 300 DPI via QPainter onto QPrinter (system print dialog provides Print-to-PDF for free)
 - [x] Ensure WYSIWYG: same layout logic for screen and print, just different DPI
-- [ ] Test with actual sticker paper
+- [ ] Test with actual sticker paper *(requires physical printer and sticker paper — not automatable)*
 
 ### Phase 5: Save / Load
 - [x] StickerProject pickle serialization (images as PNG bytes, layout metadata)
@@ -118,29 +118,29 @@ Cut lines are not visibly drawn — they're just empty gaps ("streets") between 
 - [x] Undo/redo stack (QUndoStack) for paste and delete operations
 
 ### Phase 7a: macOS Packaging
-- [ ] Create `setup.py` for py2app bundling (generates `Sticker Sheet.app`)
-- [ ] Add `Info.plist` overrides: UTI declaration for `.sticker` file type, app icon, document icon
-- [ ] Create app icon (`StickerSheet.icns`) — can be a simple placeholder generated from a PNG
-- [ ] Create document icon (`StickerDoc.icns`) for `.sticker` files
-- [ ] Handle `QFileOpenEvent` so macOS "Open With" / double-click launches the app with the file
-- [ ] Write `build_mac.sh` script that automates the full build (do NOT run — macOS-only)
-- [ ] Test that double-clicking a `.sticker` file in Finder opens the app and loads the project
+- [x] Create `setup.py` for py2app bundling (generates `Sticker Sheet.app`)
+- [x] Add `Info.plist` overrides: UTI declaration for `.sticker` file type, app icon, document icon
+- [x] Create app icon (`StickerSheet.icns`) — can be a simple placeholder generated from a PNG *(PNG generator in `icons/generate_icons.py`; `.icns` conversion requires macOS `iconutil` — see `icons/README.md`)*
+- [x] Create document icon (`StickerDoc.icns`) for `.sticker` files *(same as above)*
+- [x] Handle `QFileOpenEvent` so macOS "Open With" / double-click launches the app with the file
+- [x] Write `build_mac.sh` script that automates the full build (do NOT run — macOS-only)
+- [ ] Test that double-clicking a `.sticker` file in Finder opens the app and loads the project *(requires macOS — cannot verify on Linux)*
 
 ### Phase 7b: Test Suite (Headless / Virtual Display)
-- [ ] Add `requirements-dev.txt` with test dependencies (pytest, pytest-qt, Pillow)
-- [ ] Configure `QT_QPA_PLATFORM=offscreen` for headless Qt testing (no X11/Wayland needed)
-- [ ] Write test fixtures: generate simple shape images via Pillow (colored rectangles, circles, stars)
-- [ ] Test paste workflow: create app headless → paste generated images → verify layout runs
-- [ ] Test save/load round-trip: paste images → save `.sticker` → load → verify images match
-- [ ] Test tiler directly: feed known image sizes → verify row packing, quantization, scale-to-fit
-- [ ] Test print render: render to QPrinter with PDF output → verify file is created
-- [ ] Add `conftest.py` with shared fixtures (app instance, sample images, temp directories)
+- [x] Add `requirements-dev.txt` with test dependencies (pytest, pytest-qt, Pillow)
+- [x] Configure `QT_QPA_PLATFORM=offscreen` for headless Qt testing (no X11/Wayland needed)
+- [x] Write test fixtures: generate simple shape images via Pillow (colored rectangles, circles, stars)
+- [x] Test paste workflow: create app headless → paste generated images → verify layout runs
+- [x] Test save/load round-trip: paste images → save `.sticker` → load → verify images match
+- [x] Test tiler directly: feed known image sizes → verify row packing, quantization, scale-to-fit
+- [x] Test print render: render to QPrinter with PDF output → verify file is created
+- [x] Add `conftest.py` with shared fixtures (app instance, sample images, temp directories)
 
 ### Phase 7c: Howto Guide
-- [ ] Write `generate_howto.py` script that uses headless mode + Pillow shapes to produce a step-by-step visual guide
-- [ ] Steps captured as screenshots: empty app → paste first image → paste several → show tiled layout → save → print-to-PDF
-- [ ] Output a markdown file (`HOWTO.md`) with inline images showing each step
-- [ ] Reuse the test fixtures (Pillow-generated shapes) so the guide is reproducible and self-contained
+- [x] Write `generate_howto.py` script that uses headless mode + Pillow shapes to produce a step-by-step visual guide
+- [x] Steps captured as screenshots: empty app → paste first image → paste several → show tiled layout → save → print-to-PDF
+- [x] Output a markdown file (`HOWTO.md`) with inline images showing each step
+- [x] Reuse the test fixtures (Pillow-generated shapes) so the guide is reproducible and self-contained
 
 ### Phase 7d: Stretch Goals (Deferred)
 - [ ] ~~Multiple pages~~ — **on hold**: multi-page printing requires manual sheet feeding, not practical yet
