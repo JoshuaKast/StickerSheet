@@ -99,23 +99,23 @@ Cut lines are not visibly drawn — they're just empty gaps ("streets") between 
 - [x] Evaluate whether `rectpack` adds value over the row-based approach; use it or drop the dependency
 
 ### Phase 4: Print
-- [ ] File > Print: open QPrintDialog, render the page at 300 DPI via QPainter onto QPrinter (system print dialog provides Print-to-PDF for free)
-- [ ] Ensure WYSIWYG: same layout logic for screen and print, just different DPI
+- [x] File > Print: open QPrintDialog, render the page at 300 DPI via QPainter onto QPrinter (system print dialog provides Print-to-PDF for free)
+- [x] Ensure WYSIWYG: same layout logic for screen and print, just different DPI
 - [ ] Test with actual sticker paper
 
 ### Phase 5: Save / Load
-- [ ] StickerProject pickle serialization (images as PNG bytes, layout metadata)
-- [ ] File > Save / Save As: write `.sticker` file (pickled StickerProject)
-- [ ] File > Open: load `.sticker` file, re-tile, display
-- [ ] File > New: clear project
-- [ ] Track dirty state, prompt "unsaved changes" on close/new/open
+- [x] StickerProject pickle serialization (images as PNG bytes, layout metadata)
+- [x] File > Save / Save As: write `.sticker` file (pickled StickerProject)
+- [x] File > Open: load `.sticker` file, re-tile, display
+- [x] File > New: clear project
+- [x] Track dirty state, prompt "unsaved changes" on close/new/open
 
 ### Phase 6: Selection & Polish
-- [ ] Click an image on the page to select it (highlight border)
-- [ ] Delete key removes selected image, re-tiles
-- [ ] Cmd+C copies selected image back to clipboard (nice-to-have)
-- [ ] Right-click context menu on images (delete, copy)
-- [ ] Undo/redo stack (QUndoStack) for paste and delete operations
+- [x] Click an image on the page to select it (highlight border)
+- [x] Delete key removes selected image, re-tiles
+- [x] Cmd+C copies selected image back to clipboard (nice-to-have)
+- [x] Right-click context menu on images (delete, copy)
+- [x] Undo/redo stack (QUndoStack) for paste and delete operations
 
 ### Phase 7: Stretch Goals
 - [ ] Multiple pages (if images overflow one page, add a second)

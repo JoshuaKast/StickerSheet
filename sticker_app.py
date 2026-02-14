@@ -3,15 +3,19 @@
 
 import io
 import math
+import pickle
 import sys
 from dataclasses import dataclass, field
 
 from PIL import Image
 from PySide6.QtCore import Qt, QRectF, QPointF, QByteArray, QBuffer, QIODevice, Signal
 from PySide6.QtGui import (
-    QAction, QImage, QPixmap, QPainter, QPen, QColor, QKeySequence,
+    QAction, QImage, QPixmap, QPainter, QPen, QColor, QKeySequence, QUndoStack, QUndoCommand,
 )
-from PySide6.QtWidgets import QApplication, QMainWindow, QWidget, QStatusBar
+from PySide6.QtPrintSupport import QPrintDialog, QPrinter
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QStatusBar, QFileDialog, QMessageBox, QMenu,
+)
 
 
 # === Constants (all layout math in 300 DPI pixel space) ===
@@ -23,6 +27,8 @@ CUT_GAP = 4                    # ~4px at 300 DPI between images
 
 PRINTABLE_WIDTH = PAGE_WIDTH - 2 * MARGIN    # 2400
 PRINTABLE_HEIGHT = PAGE_HEIGHT - 2 * MARGIN  # 3150
+
+STICKER_FILTER = "Sticker Files (*.sticker)"
 
 
 # === Data Model ===
@@ -212,14 +218,17 @@ class PageWidget(QWidget):
     """Draws the US Letter page with tiled sticker images and cut lines."""
 
     images_changed = Signal()
+    selection_changed = Signal()
 
     def __init__(self, project: StickerProject, parent=None):
         super().__init__(parent)
         self.project = project
         self._pixmap_cache: dict[int, QPixmap] = {}
+        self.selected_index: int | None = None
         self.setMinimumSize(400, 500)
         self.setAcceptDrops(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
     def invalidate_cache(self):
         self._pixmap_cache.clear()
@@ -275,6 +284,7 @@ class PageWidget(QWidget):
         if layout and layout.rows:
             self._paint_images(painter, layout, scale, ox, oy)
             self._paint_cut_lines(painter, layout, scale, ox, oy)
+            self._paint_selection(painter, layout, scale, ox, oy)
 
         painter.end()
 
@@ -309,6 +319,45 @@ class PageWidget(QWidget):
                 top = oy + row.y * scale
                 bot = oy + (row.y + row.height) * scale
                 painter.drawLine(QPointF(xs, top), QPointF(xs, bot))
+
+    def _paint_selection(self, painter, layout, scale, ox, oy):
+        """Draw a highlight border around the selected image."""
+        if self.selected_index is None:
+            return
+        for placed in layout.placements:
+            if placed.image_index == self.selected_index:
+                rect = QRectF(ox + placed.x * scale, oy + placed.y * scale,
+                              placed.width * scale, placed.height * scale)
+                pen = QPen(QColor(0, 120, 215), 3)
+                painter.setPen(pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRect(rect)
+                break
+
+    def _hit_test(self, pos) -> int | None:
+        """Return the image_index of the image under the given widget position, or None."""
+        layout = self.project.layout
+        if not layout or not layout.rows:
+            return None
+        scale = self.page_scale()
+        ox, oy = self._page_origin()
+        # Check in reverse draw order so topmost image wins
+        for placed in reversed(layout.placements):
+            rect = QRectF(ox + placed.x * scale, oy + placed.y * scale,
+                          placed.width * scale, placed.height * scale)
+            if rect.contains(QPointF(pos.x(), pos.y())):
+                return placed.image_index
+        return None
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            hit = self._hit_test(event.position())
+            old = self.selected_index
+            self.selected_index = hit
+            if old != hit:
+                self.selection_changed.emit()
+                self.update()
+        super().mousePressEvent(event)
 
     # --- Drag and drop ---
 
@@ -345,26 +394,71 @@ class PageWidget(QWidget):
         except Exception:
             return False
 
-    def _add_qimage(self, qimage: QImage):
-        """Convert QImage to PNG bytes via Pillow normalization."""
+    def _qimage_to_sticker(self, qimage: QImage) -> StickerImage:
+        """Convert QImage to a StickerImage via Pillow normalization."""
         ba = QByteArray()
         buf = QBuffer(ba)
         buf.open(QIODevice.OpenModeFlag.WriteOnly)
         qimage.save(buf, "PNG")
         buf.close()
         img = Image.open(io.BytesIO(bytes(ba.data())))
-        self._add_pil(img)
+        return self._pil_to_sticker(img)
 
-    def _add_pil(self, img: Image.Image):
-        """Normalize to RGBA PNG and store in project."""
+    def _pil_to_sticker(self, img: Image.Image) -> StickerImage:
+        """Normalize to RGBA PNG and return a StickerImage."""
         img = img.convert("RGBA")
         buf = io.BytesIO()
         img.save(buf, format="PNG")
-        self.project.images.append(
-            StickerImage(png_data=buf.getvalue(),
-                         pixel_width=img.width,
-                         pixel_height=img.height)
-        )
+        return StickerImage(png_data=buf.getvalue(),
+                            pixel_width=img.width,
+                            pixel_height=img.height)
+
+    def _add_qimage(self, qimage: QImage):
+        """Convert QImage to PNG bytes and store in project."""
+        self.project.images.append(self._qimage_to_sticker(qimage))
+
+    def _add_pil(self, img: Image.Image):
+        """Normalize to RGBA PNG and store in project."""
+        self.project.images.append(self._pil_to_sticker(img))
+
+
+# === Undo Commands (Phase 6) ===
+
+class PasteImageCommand(QUndoCommand):
+    """Undoable command: paste one image."""
+
+    def __init__(self, window: "MainWindow", sticker_image: StickerImage):
+        super().__init__("Paste Image")
+        self._window = window
+        self._image = sticker_image
+
+    def redo(self):
+        self._window.project.images.append(self._image)
+        self._window._retile()
+
+    def undo(self):
+        self._window.project.images.pop()
+        self._window.page_widget.selected_index = None
+        self._window._retile()
+
+
+class DeleteImageCommand(QUndoCommand):
+    """Undoable command: delete one image by index."""
+
+    def __init__(self, window: "MainWindow", index: int):
+        super().__init__("Delete Image")
+        self._window = window
+        self._index = index
+        self._image = window.project.images[index]
+
+    def redo(self):
+        self._window.project.images.pop(self._index)
+        self._window.page_widget.selected_index = None
+        self._window._retile()
+
+    def undo(self):
+        self._window.project.images.insert(self._index, self._image)
+        self._window._retile()
 
 
 # === MainWindow ===
@@ -376,17 +470,24 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.project = StickerProject()
         self.tiler = Tiler()
+        self._file_path: str | None = None
+        self._dirty = False
+        self._undo_stack = QUndoStack(self)
+        self._undo_stack.cleanChanged.connect(self._on_clean_changed)
 
         self.setWindowTitle("Sticker Sheet Maker")
         self.resize(800, 1000)
 
         self.page_widget = PageWidget(self.project)
         self.setCentralWidget(self.page_widget)
-        self.page_widget.images_changed.connect(self._retile)
+        self.page_widget.images_changed.connect(self._on_drop_images)
+        self.page_widget.selection_changed.connect(self._on_selection_changed)
+        self.page_widget.customContextMenuRequested.connect(self._show_context_menu)
 
         self._build_menus()
         self._status = QStatusBar()
         self.setStatusBar(self._status)
+        self._update_title()
         self._update_status()
 
     def _build_menus(self):
@@ -400,11 +501,28 @@ class MainWindow(QMainWindow):
         act.triggered.connect(self._new_project)
         file_menu.addAction(act)
 
+        act = QAction("&Open...", self)
+        act.setShortcut(QKeySequence.StandardKey.Open)
+        act.triggered.connect(self._open)
+        file_menu.addAction(act)
+
+        file_menu.addSeparator()
+
+        act = QAction("&Save", self)
+        act.setShortcut(QKeySequence.StandardKey.Save)
+        act.triggered.connect(self._save)
+        file_menu.addAction(act)
+
+        act = QAction("Save &As...", self)
+        act.setShortcut(QKeySequence.StandardKey.SaveAs)
+        act.triggered.connect(self._save_as)
+        file_menu.addAction(act)
+
         file_menu.addSeparator()
 
         act = QAction("&Print...", self)
         act.setShortcut(QKeySequence.StandardKey.Print)
-        act.setEnabled(False)  # Stub — Phase 4
+        act.triggered.connect(self._print)
         file_menu.addAction(act)
 
         file_menu.addSeparator()
@@ -417,10 +535,31 @@ class MainWindow(QMainWindow):
         # Edit menu
         edit_menu = mb.addMenu("&Edit")
 
+        self._undo_action = self._undo_stack.createUndoAction(self, "&Undo")
+        self._undo_action.setShortcut(QKeySequence.StandardKey.Undo)
+        edit_menu.addAction(self._undo_action)
+
+        self._redo_action = self._undo_stack.createRedoAction(self, "&Redo")
+        self._redo_action.setShortcut(QKeySequence.StandardKey.Redo)
+        edit_menu.addAction(self._redo_action)
+
+        edit_menu.addSeparator()
+
         act = QAction("&Paste", self)
         act.setShortcut(QKeySequence.StandardKey.Paste)
         act.triggered.connect(self._paste)
         edit_menu.addAction(act)
+
+        act = QAction("&Copy", self)
+        act.setShortcut(QKeySequence.StandardKey.Copy)
+        act.triggered.connect(self._copy_selected)
+        edit_menu.addAction(act)
+
+        self._delete_action = QAction("&Delete Selected", self)
+        self._delete_action.setShortcut(QKeySequence.StandardKey.Delete)
+        self._delete_action.triggered.connect(self._delete_selected)
+        self._delete_action.setEnabled(False)
+        edit_menu.addAction(self._delete_action)
 
         edit_menu.addSeparator()
 
@@ -428,42 +567,231 @@ class MainWindow(QMainWindow):
         act.triggered.connect(self._clear_all)
         edit_menu.addAction(act)
 
+    # --- Dirty state ---
+
+    def _mark_dirty(self):
+        self._dirty = True
+        self._update_title()
+
+    def _mark_clean(self):
+        self._dirty = False
+        self._update_title()
+
+    def _on_clean_changed(self, clean: bool):
+        self._dirty = not clean
+        self._update_title()
+
+    def _update_title(self):
+        name = self._file_path.rsplit("/", 1)[-1] if self._file_path else "Untitled"
+        dirty = " *" if self._dirty else ""
+        self.setWindowTitle(f"{name}{dirty} — Sticker Sheet Maker")
+
+    def _check_unsaved(self) -> bool:
+        """Return True if it's safe to proceed (saved or discarded). False = cancelled."""
+        if not self._dirty:
+            return True
+        reply = QMessageBox.question(
+            self, "Unsaved Changes",
+            "You have unsaved changes. Do you want to save before continuing?",
+            QMessageBox.StandardButton.Save |
+            QMessageBox.StandardButton.Discard |
+            QMessageBox.StandardButton.Cancel,
+        )
+        if reply == QMessageBox.StandardButton.Save:
+            return self._save()
+        return reply == QMessageBox.StandardButton.Discard
+
+    # --- Selection ---
+
+    def _on_selection_changed(self):
+        has_sel = self.page_widget.selected_index is not None
+        self._delete_action.setEnabled(has_sel)
+        self._update_status()
+
     # --- Actions ---
 
     def _paste(self):
-        """Paste image from clipboard."""
+        """Paste image from clipboard via undo stack."""
         cb = QApplication.clipboard()
         mime = cb.mimeData()
 
+        sticker = None
         if mime.hasImage():
             qimg = cb.image()
             if not qimg.isNull():
-                self.page_widget._add_qimage(qimg)
-                self._retile()
-                return
+                sticker = self.page_widget._qimage_to_sticker(qimg)
 
-        # Fallback: try raw image data from clipboard formats
-        for fmt in mime.formats():
-            if "image" in fmt.lower():
-                data = mime.data(fmt)
-                if data:
-                    try:
-                        img = Image.open(io.BytesIO(bytes(data)))
-                        self.page_widget._add_pil(img)
-                        self._retile()
-                        return
-                    except Exception:
-                        continue
+        if sticker is None:
+            for fmt in mime.formats():
+                if "image" in fmt.lower():
+                    data = mime.data(fmt)
+                    if data:
+                        try:
+                            img = Image.open(io.BytesIO(bytes(data)))
+                            sticker = self.page_widget._pil_to_sticker(img)
+                            break
+                        except Exception:
+                            continue
+
+        if sticker:
+            self._undo_stack.push(PasteImageCommand(self, sticker))
+
+    def _on_drop_images(self):
+        """Handle images added via drag-and-drop (already in project.images)."""
+        self._undo_stack.clear()  # can't undo drops; reset baseline
+        self._retile()
+        self._mark_dirty()
+
+    def _delete_selected(self):
+        idx = self.page_widget.selected_index
+        if idx is not None and 0 <= idx < len(self.project.images):
+            self._undo_stack.push(DeleteImageCommand(self, idx))
+
+    def _copy_selected(self):
+        """Copy the selected image back to clipboard."""
+        idx = self.page_widget.selected_index
+        if idx is None or idx >= len(self.project.images):
+            return
+        data = self.project.images[idx].png_data
+        qimg = QImage()
+        qimg.loadFromData(data)
+        if not qimg.isNull():
+            QApplication.clipboard().setImage(qimg)
+
+    def _show_context_menu(self, pos):
+        idx = self.page_widget._hit_test(pos)
+        if idx is None:
+            return
+        # Select the right-clicked image
+        self.page_widget.selected_index = idx
+        self.page_widget.selection_changed.emit()
+        self.page_widget.update()
+
+        menu = QMenu(self)
+        copy_act = menu.addAction("Copy")
+        delete_act = menu.addAction("Delete")
+        chosen = menu.exec(self.page_widget.mapToGlobal(pos))
+        if chosen == copy_act:
+            self._copy_selected()
+        elif chosen == delete_act:
+            self._delete_selected()
 
     def _new_project(self):
+        if not self._check_unsaved():
+            return
         self.project.images.clear()
         self.project.layout = LayoutResult()
+        self._file_path = None
+        self._undo_stack.clear()
+        self._undo_stack.setClean()
+        self.page_widget.selected_index = None
         self.page_widget.invalidate_cache()
         self.page_widget.update()
+        self._mark_clean()
         self._update_status()
 
     def _clear_all(self):
-        self._new_project()
+        if not self.project.images:
+            return
+        if not self._check_unsaved():
+            return
+        self.project.images.clear()
+        self.project.layout = LayoutResult()
+        self._undo_stack.clear()
+        self._undo_stack.setClean()
+        self.page_widget.selected_index = None
+        self.page_widget.invalidate_cache()
+        self.page_widget.update()
+        self._mark_dirty()
+        self._update_status()
+
+    # --- Save / Load (Phase 5) ---
+
+    def _save(self) -> bool:
+        if self._file_path:
+            return self._write_file(self._file_path)
+        return self._save_as()
+
+    def _save_as(self) -> bool:
+        path, _ = QFileDialog.getSaveFileName(self, "Save Sticker Sheet", "", STICKER_FILTER)
+        if not path:
+            return False
+        if not path.endswith(".sticker"):
+            path += ".sticker"
+        return self._write_file(path)
+
+    def _write_file(self, path: str) -> bool:
+        try:
+            with open(path, "wb") as f:
+                pickle.dump(self.project, f)
+            self._file_path = path
+            self._undo_stack.setClean()
+            self._mark_clean()
+            return True
+        except Exception as e:
+            QMessageBox.critical(self, "Save Error", f"Could not save file:\n{e}")
+            return False
+
+    def _open(self):
+        if not self._check_unsaved():
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Open Sticker Sheet", "", STICKER_FILTER)
+        if not path:
+            return
+        try:
+            with open(path, "rb") as f:
+                proj = pickle.load(f)  # noqa: S301
+            if not isinstance(proj, StickerProject):
+                raise TypeError("Not a valid sticker project")
+        except Exception as e:
+            QMessageBox.critical(self, "Open Error", f"Could not open file:\n{e}")
+            return
+        self.project.images = proj.images
+        self.project.layout = proj.layout
+        self._file_path = path
+        self._undo_stack.clear()
+        self._undo_stack.setClean()
+        self.page_widget.selected_index = None
+        self.page_widget.invalidate_cache()
+        self._retile()
+        self._mark_clean()
+
+    # --- Print (Phase 4) ---
+
+    def _print(self):
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        printer.setPageSize(printer.pageLayout().pageSize())  # default to system
+        dialog = QPrintDialog(printer, self)
+        if dialog.exec() != QPrintDialog.DialogCode.Accepted:
+            return
+
+        painter = QPainter()
+        if not painter.begin(printer):
+            return
+
+        # Render at native printer resolution with the same layout
+        layout = self.project.layout
+        if not layout or not layout.rows:
+            painter.end()
+            return
+
+        # Scale from our 300 DPI coordinate system to printer DPI
+        printer_dpi_x = printer.logicalDpiX()
+        printer_dpi_y = printer.logicalDpiY()
+        sx = printer_dpi_x / DPI
+        sy = printer_dpi_y / DPI
+        painter.scale(sx, sy)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+
+        for placed in layout.placements:
+            qimg = QImage()
+            qimg.loadFromData(self.project.images[placed.image_index].png_data)
+            dest = QRectF(placed.x, placed.y, placed.width, placed.height)
+            painter.drawImage(dest, qimg)
+
+        painter.end()
+
+    # --- Retile & status ---
 
     def _retile(self):
         """Re-run the layout algorithm and repaint."""
@@ -475,16 +803,24 @@ class MainWindow(QMainWindow):
     def _update_status(self):
         n = len(self.project.images)
         zoom = int(self.page_widget.page_scale() * 100)
+        sel = self.page_widget.selected_index
         if n == 0:
             self._status.showMessage(
                 f"No images \u2014 Paste (Ctrl+V) or drag images to add | Zoom: {zoom}%")
         else:
+            sel_text = f" | Selected: #{sel + 1}" if sel is not None else ""
             self._status.showMessage(
-                f"{n} image{'s' if n != 1 else ''} | Zoom: {zoom}%")
+                f"{n} image{'s' if n != 1 else ''}{sel_text} | Zoom: {zoom}%")
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._update_status()
+
+    def closeEvent(self, event):
+        if self._check_unsaved():
+            event.accept()
+        else:
+            event.ignore()
 
 
 # === Entry Point ===
