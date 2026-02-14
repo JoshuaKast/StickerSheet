@@ -39,6 +39,13 @@ class StickerImage:
     png_data: bytes
     pixel_width: int
     pixel_height: int
+    scale_step: int = 0  # Per-image scaling: each step ≈ 20% size change
+
+    def __getattr__(self, name):
+        # Backward compat: old pickled instances lack scale_step
+        if name == 'scale_step':
+            return 0
+        raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
 
 
 @dataclass
@@ -92,24 +99,31 @@ class Tiler:
             return LayoutResult()
 
         # Step 1: Log-scale sizing — dampen resolution differences
-        ideal = []
+        raw_ideal = []
         for img in images:
             iw = math.log2(img.pixel_width + 1)
             ih = math.log2(img.pixel_height + 1)
-            ideal.append((iw, ih))
+            raw_ideal.append((iw, ih))
 
-        # Step 2: Quantize heights into row bins
+        # Step 2: Quantize heights into row bins (from UNSCALED ideals for stability)
         n_bins = self._bin_count(len(images))
-        bins = self._compute_bins([ih for _, ih in ideal], n_bins)
+        bins = self._compute_bins([ih for _, ih in raw_ideal], n_bins)
 
-        # Snap each image to nearest bin height, scale width proportionally
+        # Step 3: Apply per-image scale_step, then snap to nearest bin.
+        # Each step ≈ 1.2x size change. This naturally bumps images into
+        # adjacent bins when the scaling crosses a bin boundary.
         groups: dict[float, list[tuple[float, int]]] = {}
-        for i, (iw, ih) in enumerate(ideal):
+        for i, (iw, ih) in enumerate(raw_ideal):
+            step = getattr(images[i], 'scale_step', 0)
+            if step != 0:
+                factor = 1.2 ** step
+                iw *= factor
+                ih *= factor
             best_bin = min(bins, key=lambda b: abs(b - ih))
             scaled_w = iw * (best_bin / ih) if ih > 0 else iw
             groups.setdefault(best_bin, []).append((scaled_w, i))
 
-        # Step 3: Pack rows with scale-to-fit via binary search
+        # Step 4: Pack rows with scale-to-fit via binary search
         return self._scale_to_fit(groups)
 
     def _bin_count(self, n: int) -> int:
@@ -219,12 +233,17 @@ class PageWidget(QWidget):
 
     images_changed = Signal()
     selection_changed = Signal()
+    zoom_changed = Signal()
 
     def __init__(self, project: StickerProject, parent=None):
         super().__init__(parent)
         self.project = project
         self._pixmap_cache: dict[int, QPixmap] = {}
         self.selected_index: int | None = None
+        self._zoom: float = 1.0
+        self._pan = QPointF(0, 0)
+        self._pan_start: QPointF | None = None
+        self._pan_start_offset = QPointF(0, 0)
         self.setMinimumSize(400, 500)
         self.setAcceptDrops(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -240,19 +259,30 @@ class PageWidget(QWidget):
             self._pixmap_cache[index] = QPixmap.fromImage(qimg)
         return self._pixmap_cache[index]
 
-    def page_scale(self) -> float:
-        """Compute the scale factor from 300 DPI page coords to screen pixels."""
+    def _base_scale(self) -> float:
+        """Scale factor to fit the page into the widget at zoom=1."""
         padding = 20
         w = max(1, self.width() - 2 * padding)
         h = max(1, self.height() - 2 * padding)
         return min(w / PAGE_WIDTH, h / PAGE_HEIGHT)
 
+    def page_scale(self) -> float:
+        """Compute the scale factor from 300 DPI page coords to screen pixels."""
+        return self._base_scale() * self._zoom
+
     def _page_origin(self) -> tuple[float, float]:
-        """Top-left corner of the page on screen, centered in widget."""
+        """Top-left corner of the page on screen, centered in widget with pan offset."""
         scale = self.page_scale()
         pw = PAGE_WIDTH * scale
         ph = PAGE_HEIGHT * scale
-        return (self.width() - pw) / 2, (self.height() - ph) / 2
+        return (self.width() - pw) / 2 + self._pan.x(), (self.height() - ph) / 2 + self._pan.y()
+
+    def reset_view(self):
+        """Reset zoom and pan to defaults."""
+        self._zoom = 1.0
+        self._pan = QPointF(0, 0)
+        self.zoom_changed.emit()
+        self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -349,8 +379,48 @@ class PageWidget(QWidget):
                 return placed.image_index
         return None
 
+    def wheelEvent(self, event):
+        """Cmd+scroll or Shift+scroll to zoom toward cursor."""
+        mods = event.modifiers()
+        if mods & Qt.KeyboardModifier.ControlModifier or mods & Qt.KeyboardModifier.ShiftModifier:
+            old_scale = self.page_scale()
+            delta = event.angleDelta().y()
+            if delta == 0:
+                event.ignore()
+                return
+            factor = 1.15 if delta > 0 else 1 / 1.15
+            new_zoom = max(0.25, min(self._zoom * factor, 8.0))
+
+            if new_zoom != self._zoom:
+                mouse_pos = event.position()
+                ox, oy = self._page_origin()
+                # Point on the page under the cursor
+                rel_x = mouse_pos.x() - ox
+                rel_y = mouse_pos.y() - oy
+
+                self._zoom = new_zoom
+                new_scale = self.page_scale()
+                scale_ratio = new_scale / old_scale
+
+                # Adjust pan so the point under cursor stays fixed
+                new_ox = mouse_pos.x() - rel_x * scale_ratio
+                new_oy = mouse_pos.y() - rel_y * scale_ratio
+                base_ox = (self.width() - PAGE_WIDTH * new_scale) / 2
+                base_oy = (self.height() - PAGE_HEIGHT * new_scale) / 2
+                self._pan = QPointF(new_ox - base_ox, new_oy - base_oy)
+
+                self.zoom_changed.emit()
+                self.update()
+            event.accept()
+        else:
+            super().wheelEvent(event)
+
     def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._pan_start = event.position()
+            self._pan_start_offset = QPointF(self._pan)
+            event.accept()
+        elif event.button() == Qt.MouseButton.LeftButton:
             hit = self._hit_test(event.position())
             old = self.selected_index
             self.selected_index = hit
@@ -358,6 +428,22 @@ class PageWidget(QWidget):
                 self.selection_changed.emit()
                 self.update()
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._pan_start is not None:
+            delta = event.position() - self._pan_start
+            self._pan = self._pan_start_offset + delta
+            self.update()
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.MiddleButton and self._pan_start is not None:
+            self._pan_start = None
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
 
     # --- Drag and drop ---
 
@@ -442,6 +528,25 @@ class PasteImageCommand(QUndoCommand):
         self._window._retile()
 
 
+class ScaleImageCommand(QUndoCommand):
+    """Undoable command: change an image's scale_step."""
+
+    def __init__(self, window: "MainWindow", index: int, old_step: int, new_step: int):
+        super().__init__("Scale Image")
+        self._window = window
+        self._index = index
+        self._old_step = old_step
+        self._new_step = new_step
+
+    def redo(self):
+        self._window.project.images[self._index].scale_step = self._new_step
+        self._window._retile()
+
+    def undo(self):
+        self._window.project.images[self._index].scale_step = self._old_step
+        self._window._retile()
+
+
 class DeleteImageCommand(QUndoCommand):
     """Undoable command: delete one image by index."""
 
@@ -482,6 +587,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.page_widget)
         self.page_widget.images_changed.connect(self._on_drop_images)
         self.page_widget.selection_changed.connect(self._on_selection_changed)
+        self.page_widget.zoom_changed.connect(self._update_status)
         self.page_widget.customContextMenuRequested.connect(self._show_context_menu)
 
         self._build_menus()
@@ -658,6 +764,16 @@ class MainWindow(QMainWindow):
         if not qimg.isNull():
             QApplication.clipboard().setImage(qimg)
 
+    def _scale_selected(self, delta: int):
+        """Adjust the selected image's scale_step by delta (+1 or -1)."""
+        idx = self.page_widget.selected_index
+        if idx is None or idx >= len(self.project.images):
+            return
+        img = self.project.images[idx]
+        old_step = getattr(img, 'scale_step', 0)
+        new_step = old_step + delta
+        self._undo_stack.push(ScaleImageCommand(self, idx, old_step, new_step))
+
     def _show_context_menu(self, pos):
         idx = self.page_widget._hit_test(pos)
         if idx is None:
@@ -669,10 +785,26 @@ class MainWindow(QMainWindow):
 
         menu = QMenu(self)
         copy_act = menu.addAction("Copy")
+        menu.addSeparator()
+        scale_up_act = menu.addAction("Scale Up  ]")
+        scale_down_act = menu.addAction("Scale Down  [")
+        img = self.project.images[idx]
+        step = getattr(img, 'scale_step', 0)
+        if step != 0:
+            reset_scale_act = menu.addAction("Reset Scale")
+        else:
+            reset_scale_act = None
+        menu.addSeparator()
         delete_act = menu.addAction("Delete")
         chosen = menu.exec(self.page_widget.mapToGlobal(pos))
         if chosen == copy_act:
             self._copy_selected()
+        elif chosen == scale_up_act:
+            self._scale_selected(1)
+        elif chosen == scale_down_act:
+            self._scale_selected(-1)
+        elif chosen == reset_scale_act:
+            self._scale_selected(-step)
         elif chosen == delete_act:
             self._delete_selected()
 
@@ -806,15 +938,45 @@ class MainWindow(QMainWindow):
 
     def _update_status(self):
         n = len(self.project.images)
-        zoom = int(self.page_widget.page_scale() * 100)
+        zoom = int(self.page_widget._zoom * 100)
         sel = self.page_widget.selected_index
         if n == 0:
             self._status.showMessage(
                 f"No images \u2014 Paste (Ctrl+V) or drag images to add | Zoom: {zoom}%")
         else:
-            sel_text = f" | Selected: #{sel + 1}" if sel is not None else ""
+            sel_text = ""
+            if sel is not None and sel < n:
+                step = getattr(self.project.images[sel], 'scale_step', 0)
+                scale_text = f" (scale: {'+' if step > 0 else ''}{step})" if step != 0 else ""
+                sel_text = f" | Selected: #{sel + 1}{scale_text}"
             self._status.showMessage(
                 f"{n} image{'s' if n != 1 else ''}{sel_text} | Zoom: {zoom}%")
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        mods = event.modifiers()
+
+        # Cmd+0 / Ctrl+0: reset zoom and pan
+        if key == Qt.Key.Key_0 and mods & Qt.KeyboardModifier.ControlModifier:
+            self.page_widget.reset_view()
+            event.accept()
+            return
+
+        # ] or +/= : scale up selected image
+        if key in (Qt.Key.Key_BracketRight, Qt.Key.Key_Plus, Qt.Key.Key_Equal):
+            if not mods & Qt.KeyboardModifier.ControlModifier:
+                self._scale_selected(1)
+                event.accept()
+                return
+
+        # [ or - : scale down selected image
+        if key in (Qt.Key.Key_BracketLeft, Qt.Key.Key_Minus):
+            if not mods & Qt.KeyboardModifier.ControlModifier:
+                self._scale_selected(-1)
+                event.accept()
+                return
+
+        super().keyPressEvent(event)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
