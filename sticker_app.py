@@ -5,6 +5,7 @@ import io
 import math
 import pickle
 import sys
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 
@@ -578,18 +579,58 @@ class PageWidget(QWidget):
         except Exception:
             return False
 
+    @staticmethod
+    def _upgrade_url(url: str) -> str:
+        """Attempt to convert a thumbnail/proxy URL to a higher-resolution original.
+
+        Supported sites:
+        - DuckDuckGo image proxy: extracts the original URL from the 'u' query param.
+        - Wikipedia/Wikimedia thumbnails: strips /thumb/ and the size suffix to get
+          the full-resolution original.
+
+        Returns the upgraded URL, or the original URL unchanged if no pattern matches.
+        """
+        parsed = urllib.parse.urlparse(url)
+
+        # DuckDuckGo image proxy: external-content.duckduckgo.com/iu/?u=<original>
+        if (parsed.hostname and parsed.hostname.endswith("duckduckgo.com")
+                and parsed.path == "/iu/"):
+            params = urllib.parse.parse_qs(parsed.query)
+            if "u" in params:
+                return params["u"][0]
+
+        # Wikipedia / Wikimedia thumbnails:
+        #   .../thumb/{h1}/{h2}/{Filename}/{width}px-{Filename}
+        # becomes:
+        #   .../{h1}/{h2}/{Filename}
+        if (parsed.hostname and parsed.hostname.endswith("wikimedia.org")
+                and "/thumb/" in parsed.path):
+            path = parsed.path.replace("/thumb/", "/", 1)
+            path = path.rsplit("/", 1)[0]  # drop the sized filename suffix
+            return urllib.parse.urlunparse(parsed._replace(path=path))
+
+        return url
+
     def _load_url(self, url: str) -> bool:
-        """Download an image from a URL and add it to the project."""
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "StickerSheet/1.0"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = resp.read(10 * 1024 * 1024)  # 10 MB limit
-            img = Image.open(io.BytesIO(data))
-            img.load()
-            self._add_pil(img)
-            return True
-        except Exception:
-            return False
+        """Download an image from a URL and add it to the project.
+
+        Tries to upgrade thumbnail/proxy URLs to full-resolution originals first
+        (DuckDuckGo, Wikipedia). Falls back to the original URL on failure.
+        """
+        upgraded = self._upgrade_url(url)
+        for attempt_url in ([upgraded, url] if upgraded != url else [url]):
+            try:
+                req = urllib.request.Request(
+                    attempt_url, headers={"User-Agent": "StickerSheet/1.0"})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = resp.read(10 * 1024 * 1024)  # 10 MB limit
+                img = Image.open(io.BytesIO(data))
+                img.load()
+                self._add_pil(img)
+                return True
+            except Exception:
+                continue
+        return False
 
     def _qimage_to_sticker(self, qimage: QImage) -> StickerImage:
         """Convert QImage to a StickerImage via Pillow normalization."""
