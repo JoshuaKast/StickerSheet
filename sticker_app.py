@@ -318,6 +318,43 @@ class PageWidget(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
+    def event(self, event):
+        """Handle native gesture events (macOS trackpad pinch-to-zoom)."""
+        if event.type() == QEvent.Type.NativeGesture:
+            try:
+                if event.gestureType() == Qt.NativeGestureType.ZoomNativeGesture:
+                    self._handle_pinch_zoom(event)
+                    return True
+            except AttributeError:
+                pass  # Platform doesn't support NativeGestureType
+        return super().event(event)
+
+    def _handle_pinch_zoom(self, event):
+        """Zoom toward the pinch center point on trackpad pinch gestures."""
+        factor = 1.0 + event.value()
+        new_zoom = max(0.25, min(self._zoom * factor, 8.0))
+        if new_zoom == self._zoom:
+            return
+
+        old_scale = self.page_scale()
+        mouse_pos = event.position()
+        ox, oy = self._page_origin()
+        rel_x = mouse_pos.x() - ox
+        rel_y = mouse_pos.y() - oy
+
+        self._zoom = new_zoom
+        new_scale = self.page_scale()
+        scale_ratio = new_scale / old_scale
+
+        new_ox = mouse_pos.x() - rel_x * scale_ratio
+        new_oy = mouse_pos.y() - rel_y * scale_ratio
+        base_ox = (self.width() - self._page_w() * new_scale) / 2
+        base_oy = (self.height() - self._page_h() * new_scale) / 2
+        self._pan = QPointF(new_ox - base_ox, new_oy - base_oy)
+
+        self.zoom_changed.emit()
+        self.update()
+
     def invalidate_cache(self):
         self._pixmap_cache.clear()
 
@@ -502,12 +539,23 @@ class PageWidget(QWidget):
                 self.update()
             event.accept()
         else:
-            super().wheelEvent(event)
+            # Unmodified scroll → pan (natural two-finger trackpad scrolling on macOS)
+            pd = event.pixelDelta()
+            if not pd.isNull():
+                # pixelDelta is precise on macOS trackpads
+                self._pan += QPointF(pd.x(), pd.y())
+            else:
+                # Fallback for mouse wheels
+                self._pan += QPointF(event.angleDelta().x() / 2,
+                                     event.angleDelta().y() / 2)
+            self.update()
+            event.accept()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.MiddleButton:
             self._pan_start = event.position()
             self._pan_start_offset = QPointF(self._pan)
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
             event.accept()
         elif event.button() == Qt.MouseButton.LeftButton:
             hit = self._hit_test(event.position())
@@ -516,20 +564,28 @@ class PageWidget(QWidget):
             if old != hit:
                 self.selection_changed.emit()
                 self.update()
+            if hit is None:
+                # Clicked empty space — allow drag-to-pan
+                self._pan_start = event.position()
+                self._pan_start_offset = QPointF(self._pan)
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
         if self._pan_start is not None:
             delta = event.position() - self._pan_start
             self._pan = self._pan_start_offset + delta
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
             self.update()
             event.accept()
         else:
             super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MouseButton.MiddleButton and self._pan_start is not None:
+        if self._pan_start is not None and event.button() in (
+            Qt.MouseButton.MiddleButton, Qt.MouseButton.LeftButton
+        ):
             self._pan_start = None
+            self.unsetCursor()
             event.accept()
         else:
             super().mouseReleaseEvent(event)
@@ -821,7 +877,12 @@ class MainWindow(QMainWindow):
     def _build_menus(self):
         mb = self.menuBar()
 
-        # File menu
+        # --- About action (macOS places this in the app menu automatically) ---
+        about_act = QAction("&About Sticker Sheet Maker", self)
+        about_act.setMenuRole(QAction.MenuRole.AboutRole)
+        about_act.triggered.connect(self._show_about)
+
+        # --- File menu ---
         file_menu = mb.addMenu("&File")
 
         act = QAction("&New", self)
@@ -835,6 +896,11 @@ class MainWindow(QMainWindow):
         file_menu.addAction(act)
 
         file_menu.addSeparator()
+
+        act = QAction("&Close Window", self)
+        act.setShortcut(QKeySequence.StandardKey.Close)
+        act.triggered.connect(self.close)
+        file_menu.addAction(act)
 
         act = QAction("&Save", self)
         act.setShortcut(QKeySequence.StandardKey.Save)
@@ -860,7 +926,7 @@ class MainWindow(QMainWindow):
         act.triggered.connect(self.close)
         file_menu.addAction(act)
 
-        # Edit menu
+        # --- Edit menu ---
         edit_menu = mb.addMenu("&Edit")
 
         self._undo_action = self._undo_stack.createUndoAction(self, "&Undo")
@@ -897,9 +963,40 @@ class MainWindow(QMainWindow):
 
         edit_menu.addSeparator()
 
-        act = QAction("Se&ttings...", self)
+        # Preferences — macOS auto-moves this to the app menu via PreferencesRole
+        act = QAction("&Preferences...", self)
+        act.setShortcut(QKeySequence("Ctrl+,"))
+        act.setMenuRole(QAction.MenuRole.PreferencesRole)
         act.triggered.connect(self._show_settings)
         edit_menu.addAction(act)
+
+        # About must be added to a menu for macOS role handling to pick it up
+        edit_menu.addAction(about_act)
+
+        # --- View menu ---
+        view_menu = mb.addMenu("&View")
+
+        act = QAction("Zoom &In", self)
+        act.setShortcut(QKeySequence.StandardKey.ZoomIn)
+        act.triggered.connect(lambda: self._zoom_view(1.25))
+        view_menu.addAction(act)
+
+        act = QAction("Zoom &Out", self)
+        act.setShortcut(QKeySequence.StandardKey.ZoomOut)
+        act.triggered.connect(lambda: self._zoom_view(1 / 1.25))
+        view_menu.addAction(act)
+
+        act = QAction("Zoom to &Fit", self)
+        act.setShortcut(QKeySequence("Ctrl+0"))
+        act.triggered.connect(self.page_widget.reset_view)
+        view_menu.addAction(act)
+
+        view_menu.addSeparator()
+
+        self._fullscreen_action = QAction("Enter Full Screen", self)
+        self._fullscreen_action.setShortcut(QKeySequence.StandardKey.FullScreen)
+        self._fullscreen_action.triggered.connect(self._toggle_full_screen)
+        view_menu.addAction(self._fullscreen_action)
 
     # --- Dirty state ---
 
@@ -919,6 +1016,9 @@ class MainWindow(QMainWindow):
         name = self._file_path.rsplit("/", 1)[-1] if self._file_path else "Untitled"
         dirty = " *" if self._dirty else ""
         self.setWindowTitle(f"{name}{dirty} — Sticker Sheet Maker")
+        # macOS shows a proxy icon in the title bar when windowFilePath is set;
+        # Cmd-clicking the title reveals the file's path in Finder.
+        self.setWindowFilePath(self._file_path or "")
 
     def _check_unsaved(self) -> bool:
         """Return True if it's safe to proceed (saved or discarded). False = cancelled."""
@@ -1081,6 +1181,34 @@ class MainWindow(QMainWindow):
         self.tiler = Tiler(self.project.settings)
         self._retile()
 
+    # --- View actions ---
+
+    def _show_about(self):
+        QMessageBox.about(
+            self,
+            "About Sticker Sheet Maker",
+            "Sticker Sheet Maker\n\n"
+            "Tile pasted images onto a printable page\n"
+            "for sticker sheets.",
+        )
+
+    def _zoom_view(self, factor: float):
+        """Zoom the page view by the given factor."""
+        pw = self.page_widget
+        new_zoom = max(0.25, min(pw._zoom * factor, 8.0))
+        if new_zoom != pw._zoom:
+            pw._zoom = new_zoom
+            pw.zoom_changed.emit()
+            pw.update()
+
+    def _toggle_full_screen(self):
+        if self.isFullScreen():
+            self.showNormal()
+            self._fullscreen_action.setText("Enter Full Screen")
+        else:
+            self.showFullScreen()
+            self._fullscreen_action.setText("Exit Full Screen")
+
     # --- Save / Load (Phase 5) ---
 
     def _save(self) -> bool:
@@ -1186,9 +1314,12 @@ class MainWindow(QMainWindow):
         n = len(self.project.images)
         zoom = int(self.page_widget._zoom * 100)
         sel = self.page_widget.selected_index
+        paste_shortcut = QKeySequence(
+            QKeySequence.StandardKey.Paste
+        ).toString(QKeySequence.SequenceFormat.NativeText)
         if n == 0:
             self._status.showMessage(
-                f"No images \u2014 Paste (Ctrl+V) or drag images to add | Zoom: {zoom}%")
+                f"No images \u2014 Paste ({paste_shortcut}) or drag images to add | Zoom: {zoom}%")
         else:
             sel_text = ""
             if sel is not None and sel < n:
@@ -1201,12 +1332,6 @@ class MainWindow(QMainWindow):
     def keyPressEvent(self, event):
         key = event.key()
         mods = event.modifiers()
-
-        # Cmd+0 / Ctrl+0: reset zoom and pan
-        if key == Qt.Key.Key_0 and mods & Qt.KeyboardModifier.ControlModifier:
-            self.page_widget.reset_view()
-            event.accept()
-            return
 
         # ] or +/= : scale up selected image
         if key in (Qt.Key.Key_BracketRight, Qt.Key.Key_Plus, Qt.Key.Key_Equal):
