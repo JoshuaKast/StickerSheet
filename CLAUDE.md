@@ -117,8 +117,33 @@ Cut lines are not visibly drawn — they're just empty gaps ("streets") between 
 - [x] Right-click context menu on images (delete, copy)
 - [x] Undo/redo stack (QUndoStack) for paste and delete operations
 
-### Phase 7: Stretch Goals
-- [ ] Multiple pages (if images overflow one page, add a second)
+### Phase 7a: macOS Packaging
+- [ ] Create `setup.py` for py2app bundling (generates `Sticker Sheet.app`)
+- [ ] Add `Info.plist` overrides: UTI declaration for `.sticker` file type, app icon, document icon
+- [ ] Create app icon (`StickerSheet.icns`) — can be a simple placeholder generated from a PNG
+- [ ] Create document icon (`StickerDoc.icns`) for `.sticker` files
+- [ ] Handle `QFileOpenEvent` so macOS "Open With" / double-click launches the app with the file
+- [ ] Write `build_mac.sh` script that automates the full build (do NOT run — macOS-only)
+- [ ] Test that double-clicking a `.sticker` file in Finder opens the app and loads the project
+
+### Phase 7b: Test Suite (Headless / Virtual Display)
+- [ ] Add `requirements-dev.txt` with test dependencies (pytest, pytest-qt, Pillow)
+- [ ] Configure `QT_QPA_PLATFORM=offscreen` for headless Qt testing (no X11/Wayland needed)
+- [ ] Write test fixtures: generate simple shape images via Pillow (colored rectangles, circles, stars)
+- [ ] Test paste workflow: create app headless → paste generated images → verify layout runs
+- [ ] Test save/load round-trip: paste images → save `.sticker` → load → verify images match
+- [ ] Test tiler directly: feed known image sizes → verify row packing, quantization, scale-to-fit
+- [ ] Test print render: render to QPrinter with PDF output → verify file is created
+- [ ] Add `conftest.py` with shared fixtures (app instance, sample images, temp directories)
+
+### Phase 7c: Howto Guide
+- [ ] Write `generate_howto.py` script that uses headless mode + Pillow shapes to produce a step-by-step visual guide
+- [ ] Steps captured as screenshots: empty app → paste first image → paste several → show tiled layout → save → print-to-PDF
+- [ ] Output a markdown file (`HOWTO.md`) with inline images showing each step
+- [ ] Reuse the test fixtures (Pillow-generated shapes) so the guide is reproducible and self-contained
+
+### Phase 7d: Stretch Goals (Deferred)
+- [ ] ~~Multiple pages~~ — **on hold**: multi-page printing requires manual sheet feeding, not practical yet
 - [ ] Manual image reordering / pinning (lock an image's position)
 - [ ] Adjustable margins and cut-line style in preferences
 - [ ] Global hotkey to capture image under mouse cursor from browser — ideas:
@@ -126,6 +151,280 @@ Cut lines are not visibly drawn — they're just empty gaps ("streets") between 
   - **Accessibility API approach**: Use macOS Accessibility APIs (via PyObjC) to inspect the browser's DOM/AX tree for the image element under the cursor and extract its URL.
   - **PySide6 embedded QWebEngineView**: Ship a built-in mini-browser inside the app. User browses in-app; on click or hotkey, the app intercepts the image directly from the web engine. Full control, no AppleScript, but adds QtWebEngine as a heavy dependency.
   - **System-wide drag target**: Keep the app as a floating always-on-top thumbnail/dock. User drags images from any browser onto it. Already partially works via drag-and-drop; this just makes the drop target more accessible.
+
+## Phase 7 Implementation Details
+
+### 7a: macOS Packaging — Actionable Plan
+
+**Goal**: Produce a `Sticker Sheet.app` bundle that users can drag to `/Applications`. Double-clicking a `.sticker` file opens the app and loads the project.
+
+**Tool choice: py2app** (not PyInstaller). py2app is the native Python→macOS .app bundler, produces proper bundles with `Info.plist`, and handles Qt frameworks well. PyInstaller works too but py2app gives more direct control over the plist and bundle structure.
+
+#### Files to create
+
+1. **`setup.py`** — py2app build script
+   ```python
+   from setuptools import setup
+
+   APP = ['sticker_app.py']
+   DATA_FILES = []
+   OPTIONS = {
+       'argv_emulation': False,  # must be False for Qt apps
+       'iconfile': 'icons/StickerSheet.icns',
+       'plist': {
+           'CFBundleName': 'Sticker Sheet',
+           'CFBundleDisplayName': 'Sticker Sheet',
+           'CFBundleIdentifier': 'com.stickersheet.app',
+           'CFBundleVersion': '1.0.0',
+           'CFBundleShortVersionString': '1.0',
+           'LSMinimumSystemVersion': '11.0',
+           'NSHighResolutionCapable': True,
+           'CFBundleDocumentTypes': [{
+               'CFBundleTypeName': 'Sticker Sheet Project',
+               'CFBundleTypeExtensions': ['sticker'],
+               'CFBundleTypeIconFile': 'StickerDoc',
+               'CFBundleTypeRole': 'Editor',
+               'LSHandlerRank': 'Owner',
+               'LSItemContentTypes': ['com.stickersheet.sticker'],
+           }],
+           'UTExportedTypeDeclarations': [{
+               'UTTypeIdentifier': 'com.stickersheet.sticker',
+               'UTTypeDescription': 'Sticker Sheet Project',
+               'UTTypeConformsTo': ['public.data'],
+               'UTTypeTagSpecification': {
+                   'public.filename-extension': ['sticker'],
+               },
+           }],
+       },
+       'packages': ['PySide6', 'PIL'],
+   }
+
+   setup(
+       app=APP,
+       data_files=DATA_FILES,
+       options={'py2app': OPTIONS},
+       setup_requires=['py2app'],
+   )
+   ```
+
+2. **`icons/StickerSheet.icns`** + **`icons/StickerDoc.icns`** — macOS icon files
+   - Can be created from a 1024x1024 PNG using `iconutil` on macOS:
+     ```bash
+     mkdir StickerSheet.iconset
+     # add icon_16x16.png through icon_512x512@2x.png
+     iconutil -c icns StickerSheet.iconset
+     ```
+   - For now, create placeholder PNGs via Pillow (a colored square with "SS" text) and document the `iconutil` conversion step in the build script
+
+3. **`build_mac.sh`** — build automation script
+   ```bash
+   #!/bin/bash
+   set -e
+   # Clean previous builds
+   rm -rf build dist
+   # Create venv and install deps
+   python3 -m venv .venv-build
+   source .venv-build/bin/activate
+   pip install -r requirements.txt py2app
+   # Generate icons if .icns files don't exist
+   if [ ! -f icons/StickerSheet.icns ]; then
+       echo "WARNING: .icns files missing. Generate them with iconutil on macOS."
+       echo "See icons/README.md for instructions."
+   fi
+   # Build the app
+   python setup.py py2app
+   # Result is in dist/Sticker Sheet.app
+   echo "Built: dist/Sticker Sheet.app"
+   ```
+
+#### Code changes to `sticker_app.py`
+
+- **Handle `QFileOpenEvent`**: macOS sends a `QFileOpenEvent` when a user double-clicks a `.sticker` file. The app must override `QApplication.event()` to catch this:
+  ```python
+  class StickerApp(QApplication):
+      file_open_requested = Signal(str)
+
+      def event(self, event):
+          if event.type() == QEvent.FileOpen:
+              self.file_open_requested.emit(event.file())
+              return True
+          return super().event(event)
+  ```
+  Then connect `file_open_requested` to `MainWindow.open_file(path)`.
+
+- **Command-line file argument**: Also check `sys.argv[1]` at startup for a file path (some launch mechanisms pass the file as an argument rather than via `QFileOpenEvent`).
+
+#### UTI / File type registration explained
+
+- `CFBundleDocumentTypes` tells macOS "this app can open `.sticker` files"
+- `UTExportedTypeDeclarations` defines the UTI `com.stickersheet.sticker` as a new file type
+- `LSHandlerRank: Owner` means this app claims primary ownership of `.sticker` files
+- After first launch, macOS Launch Services registers the association — `.sticker` files get the document icon and double-click opens the app
+- `lsregister -dump | grep sticker` can verify registration (debug only)
+
+---
+
+### 7b: Test Suite — Actionable Plan
+
+**Goal**: A pytest suite that runs headless (no display server) and tests the core workflows.
+
+**Key technique**: `QT_QPA_PLATFORM=offscreen` — Qt's offscreen platform plugin renders to an in-memory surface. No X11, no Wayland, no Xvfb needed. Works on macOS, Linux, and CI. This is simpler and more portable than `pytest-xvfb`.
+
+#### Files to create
+
+1. **`requirements-dev.txt`**
+   ```
+   -r requirements.txt
+   pytest>=7.0
+   pytest-qt>=4.2
+   ```
+
+2. **`conftest.py`** — shared fixtures
+   ```python
+   import os
+   os.environ['QT_QPA_PLATFORM'] = 'offscreen'  # must be set before QApplication
+
+   import pytest
+   from PIL import Image
+   import io
+
+   @pytest.fixture(scope='session')
+   def qapp():
+       """Create a single QApplication for all tests."""
+       from sticker_app import StickerApp  # or QApplication
+       app = StickerApp([])
+       yield app
+
+   @pytest.fixture
+   def sample_images():
+       """Generate simple Pillow shape images as PNG bytes."""
+       images = []
+       colors = ['red', 'blue', 'green', 'orange', 'purple']
+       sizes = [(200, 200), (300, 150), (150, 300), (400, 400), (100, 250)]
+       for color, size in zip(colors, sizes):
+           img = Image.new('RGB', size, color)
+           buf = io.BytesIO()
+           img.save(buf, format='PNG')
+           images.append(buf.getvalue())
+       return images
+
+   @pytest.fixture
+   def circle_image():
+       """A single circle-on-white image for simple tests."""
+       img = Image.new('RGB', (200, 200), 'white')
+       from PIL import ImageDraw
+       draw = ImageDraw.Draw(img)
+       draw.ellipse([20, 20, 180, 180], fill='red', outline='black')
+       buf = io.BytesIO()
+       img.save(buf, format='PNG')
+       return buf.getvalue()
+   ```
+
+3. **`tests/test_tiler.py`** — unit tests for the layout engine
+   - Test log-scale sizing: known pixel dims → expected ideal sizes
+   - Test height quantization: given a set of ideal heights, verify bin assignment
+   - Test row packing: given quantized images, verify rows don't exceed page width
+   - Test scale-to-fit: stuff enough images to overflow, verify all rows shrink uniformly
+
+4. **`tests/test_project.py`** — save/load round-trip
+   - Create `StickerProject`, add images, pickle-save to temp file, load back, compare
+
+5. **`tests/test_app.py`** — integration tests via pytest-qt
+   - `qtbot.addWidget(main_window)` for lifecycle management
+   - Simulate paste: directly call the paste handler with a `QImage` loaded from a Pillow PNG
+   - Verify `PageWidget` repaints and image count updates
+   - Simulate File > Save, verify `.sticker` file written
+   - Simulate File > Open with saved file, verify images loaded
+
+6. **`tests/test_print.py`** — print/render test
+   - Use `QPrinter` with `QPrinter.PdfFormat` output to a temp file
+   - Render the page via the same paint logic
+   - Verify the PDF file exists and is non-empty (deeper PDF inspection optional)
+
+#### Dev commands addition
+
+```bash
+# Run tests (headless, no display needed)
+QT_QPA_PLATFORM=offscreen pytest -v
+
+# Run tests with coverage
+QT_QPA_PLATFORM=offscreen pytest --cov=sticker_app -v
+```
+
+---
+
+### 7c: Howto Guide — Actionable Plan
+
+**Goal**: A self-contained script that generates a step-by-step visual guide by driving the app headlessly and capturing screenshots at each step.
+
+**Approach**: Use the same `QT_QPA_PLATFORM=offscreen` technique. The script creates a `MainWindow`, pastes Pillow-generated shape images one by one, and grabs the widget as a `QImage` after each step. Each screenshot is saved to `howto/` and a `HOWTO.md` is assembled referencing them.
+
+#### `generate_howto.py` outline
+
+```python
+"""Generate HOWTO.md with screenshots by driving the app headlessly."""
+import os
+os.environ['QT_QPA_PLATFORM'] = 'offscreen'
+
+from PIL import Image, ImageDraw
+from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QSize
+# ... import MainWindow, StickerProject, etc.
+
+def generate_shape_images():
+    """Create a variety of colorful shapes using Pillow."""
+    shapes = []
+    # Red circle
+    img = Image.new('RGBA', (200, 200), (255, 255, 255, 0))
+    draw = ImageDraw.Draw(img)
+    draw.ellipse([10, 10, 190, 190], fill='red')
+    shapes.append(('red_circle', img))
+    # Blue star, green rectangle, etc.
+    # ...
+    return shapes
+
+def capture_widget(widget, path):
+    """Grab a widget's rendered content as a PNG."""
+    pixmap = widget.grab(widget.rect())
+    pixmap.save(path, 'PNG')
+
+def main():
+    app = QApplication([])
+    win = MainWindow()
+    win.resize(QSize(800, 600))
+    win.show()
+    os.makedirs('howto', exist_ok=True)
+
+    # Step 1: Empty app
+    capture_widget(win, 'howto/01_empty.png')
+
+    # Step 2: Paste first image
+    shapes = generate_shape_images()
+    # ... paste shapes[0] into project ...
+    capture_widget(win, 'howto/02_first_paste.png')
+
+    # Step 3-5: Paste more images, showing tiling
+    # ... paste remaining shapes ...
+    capture_widget(win, 'howto/03_multiple.png')
+
+    # Step 6: Save
+    # ... trigger save ...
+    capture_widget(win, 'howto/04_saved.png')
+
+    # Write HOWTO.md
+    with open('HOWTO.md', 'w') as f:
+        f.write('# Sticker Sheet — How To Use\n\n')
+        f.write('## 1. Launch the app\n\n')
+        f.write('![Empty app](howto/01_empty.png)\n\n')
+        # ... more steps ...
+
+if __name__ == '__main__':
+    main()
+```
+
+The shapes from Pillow serve double duty: they're used in the test suite fixtures AND in the howto guide, keeping everything self-contained with no external image dependencies.
+
+---
 
 ## Dev Commands
 
@@ -140,16 +439,45 @@ python sticker_app.py
 
 # Run with debug logging
 python sticker_app.py --debug
+
+# Run tests (headless, no display server needed)
+pip install -r requirements-dev.txt
+QT_QPA_PLATFORM=offscreen pytest -v
+
+# Run tests with coverage
+QT_QPA_PLATFORM=offscreen pytest --cov=sticker_app -v
+
+# Generate howto guide (headless)
+QT_QPA_PLATFORM=offscreen python generate_howto.py
+
+# Build macOS app (macOS only — do not run on other platforms)
+./build_mac.sh
 ```
 
 ## File Structure (target)
 
 ```
-Stickers/
-  CLAUDE.md          # this file
-  requirements.txt
-  sticker_app.py     # main application (single file to start)
-  .venv/             # virtual environment (gitignored)
+StickerSheet/
+  CLAUDE.md              # this file
+  requirements.txt       # runtime dependencies
+  requirements-dev.txt   # test/dev dependencies
+  sticker_app.py         # main application
+  setup.py               # py2app build configuration
+  build_mac.sh           # macOS .app build script
+  generate_howto.py      # headless howto guide generator
+  conftest.py            # pytest shared fixtures
+  tests/
+    test_tiler.py        # layout engine unit tests
+    test_project.py      # save/load round-trip tests
+    test_app.py          # integration tests via pytest-qt
+    test_print.py        # print/render tests
+  icons/
+    StickerSheet.icns    # app icon (macOS)
+    StickerDoc.icns      # document icon for .sticker files
+    README.md            # instructions for regenerating .icns from PNGs
+  howto/                 # generated screenshots (gitignored)
+  HOWTO.md               # generated howto guide
+  .venv/                 # virtual environment (gitignored)
 ```
 
 ## Design Decisions
