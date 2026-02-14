@@ -1,15 +1,14 @@
 # Sticker Sheet Maker
 
-A desktop app for tiling pasted images onto a US Letter page for printing as sticker sheets. Copy images from your browser, paste them into the app, and print onto sticker paper.
+A desktop app for tiling images onto a US Letter page for printing. Copy images to your clipboard, paste them into the app, and print onto sticker paper, photo paper, or any other media.
 
 ## How It Works
 
-1. Browse images in your web browser
-2. Copy an image to your clipboard and paste it into the app (Cmd/Ctrl+V), or drag and drop image files
-3. The app automatically tiles all images onto a printable page with straight cutting paths between them
-4. Print onto sticker paper and cut along the gaps
+1. Copy an image to your clipboard and paste it into the app (Cmd/Ctrl+V), or drag and drop image files
+2. The app automatically tiles all images onto a printable page with straight cutting paths between them
+3. Print and cut along the gaps
 
-Images are sized using log-scale compression so stickers come out roughly consistent in size regardless of source resolution. Heights are quantized into row bins to create straight horizontal cut lines across the full page.
+Images are sized using log-scale compression so they come out roughly consistent in size regardless of source resolution. Heights are quantized into row bins to create straight horizontal cut lines across the full page.
 
 ## Requirements
 
