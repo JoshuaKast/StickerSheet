@@ -6,8 +6,6 @@ build/
 dist/
 *.egg-info/
 .pytest_cache/
-howto/
-HOWTO.md
-icons/*.png
+*.sticker
 icons/*.icns
 icons/*.iconset/
