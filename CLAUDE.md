@@ -9,7 +9,7 @@ The user browses image sources (DuckDuckGo Images, etc.) in a browser, copies im
 ## Tech Stack
 
 - **GUI**: PySide6 (Qt6 for Python, LGPL, native macOS look)
-- **Bin Packing**: `rectpack` — mature 2D rectangle packing with rotation support, guillotine/maxrects/skyline algorithms, fixed bin size
+- **Layout**: Custom row-based tiler — log-scale sizing, row-height quantization, row packing (rectpack evaluated and dropped; row-based approach gives straight cut lines)
 - **Image Handling**: Pillow (for image normalization before packing) + Qt's QImage/QPixmap (for display and print)
 - **Project Files**: Python `pickle` — serialize the full project (image data + layout) into a single `.sticker` file
 - **Print**: QPrintDialog / QPrinter (native macOS print dialog)
@@ -75,25 +75,25 @@ This approach may or may not use `rectpack` — it might be simpler to implement
 ## Roadmap
 
 ### Phase 1: Skeleton App
-- [x] Create `requirements.txt` (PySide6, rectpack, Pillow)
-- [ ] Main window with menu bar (File, Edit menus — stubs)
-- [ ] PageWidget that draws a white US Letter rectangle centered in the window, scaled to fit
-- [ ] Status bar showing image count and zoom level
+- [x] Create `requirements.txt` (PySide6, Pillow)
+- [x] Main window with menu bar (File, Edit menus — stubs)
+- [x] PageWidget that draws a white US Letter rectangle centered in the window, scaled to fit
+- [x] Status bar showing image count and zoom level
 
 ### Phase 2: Paste & Display
-- [ ] Handle Cmd+V / clipboard paste: extract image from clipboard (QClipboard.image())
-- [ ] Also handle drag-and-drop of image files onto the window
-- [ ] Store pasted images in StickerProject as PNG byte blobs (normalize all formats to PNG via Pillow)
-- [ ] Display pasted images in a simple grid on the page (temporary, before real packing)
+- [x] Handle Cmd+V / clipboard paste: extract image from clipboard (QClipboard.image())
+- [x] Also handle drag-and-drop of image files onto the window
+- [x] Store pasted images in StickerProject as PNG byte blobs (normalize all formats to PNG via Pillow)
+- [x] Display pasted images in a simple grid on the page (temporary, before real packing)
 
 ### Phase 3: Layout / Tiling
-- [ ] Implement log-scale sizing: convert pixel dimensions to ideal print sizes via `log2(px + 1)`, preserving aspect ratio
-- [ ] Implement row-height quantization: cluster ideal heights into N bins, snap each image to nearest bin
-- [ ] Implement row packing: fill rows left-to-right, stack rows top-to-bottom
-- [ ] Implement scale-to-fit: if rows overflow the page, uniformly shrink all bin heights and repack (binary search)
-- [ ] On every paste/delete, re-run layout and update PageWidget
-- [ ] Draw cut lines: full-width horizontal lines between rows, vertical lines between images within a row
-- [ ] Evaluate whether `rectpack` adds value over the row-based approach; use it or drop the dependency
+- [x] Implement log-scale sizing: convert pixel dimensions to ideal print sizes via `log2(px + 1)`, preserving aspect ratio
+- [x] Implement row-height quantization: cluster ideal heights into N bins, snap each image to nearest bin
+- [x] Implement row packing: fill rows left-to-right, stack rows top-to-bottom
+- [x] Implement scale-to-fit: if rows overflow the page, uniformly shrink all bin heights and repack (binary search)
+- [x] On every paste/delete, re-run layout and update PageWidget
+- [x] Draw cut lines: full-width horizontal lines between rows, vertical lines between images within a row
+- [x] Evaluate whether `rectpack` adds value over the row-based approach; use it or drop the dependency
 
 ### Phase 4: Print
 - [ ] File > Print: open QPrintDialog, render the page at 300 DPI via QPainter onto QPrinter
