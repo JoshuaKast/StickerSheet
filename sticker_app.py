@@ -16,6 +16,7 @@ from PySide6.QtGui import (
 from PySide6.QtPrintSupport import QPrintDialog, QPrinter
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QStatusBar, QFileDialog, QMessageBox, QMenu,
+    QDialog, QDialogButtonBox, QFormLayout, QComboBox, QDoubleSpinBox, QVBoxLayout, QGroupBox,
 )
 
 
@@ -31,8 +32,65 @@ PRINTABLE_HEIGHT = PAGE_HEIGHT - 2 * MARGIN  # 3150
 
 STICKER_FILTER = "Sticker Files (*.sticker)"
 
+# Standard paper sizes as (name, width_inches, height_inches)
+PAPER_SIZES = [
+    ("US Letter (8.5 × 11 in)", 8.5, 11.0),
+    ("US Legal (8.5 × 14 in)", 8.5, 14.0),
+    ("Tabloid (11 × 17 in)", 11.0, 17.0),
+    ("A4 (210 × 297 mm)", 8.267, 11.692),
+    ("A3 (297 × 420 mm)", 11.692, 16.535),
+]
+
+CUT_LINE_STYLES = ["None", "Dashed", "Dotted", "Solid"]
+
 
 # === Data Model ===
+
+@dataclass
+class PageSettings:
+    """Configurable page layout settings."""
+    paper_size_index: int = 0          # Index into PAPER_SIZES
+    margin_inches: float = 0.25        # Margin on all sides, in inches
+    cut_line_style: int = 1            # Index into CUT_LINE_STYLES (default: Dashed)
+    street_width_inches: float = 0.125  # Min gap between images, in inches (1/8")
+
+    @property
+    def page_width(self) -> int:
+        _, w, _ = PAPER_SIZES[self.paper_size_index]
+        return int(w * DPI)
+
+    @property
+    def page_height(self) -> int:
+        _, _, h = PAPER_SIZES[self.paper_size_index]
+        return int(h * DPI)
+
+    @property
+    def margin(self) -> int:
+        return int(self.margin_inches * DPI)
+
+    @property
+    def cut_gap(self) -> int:
+        return max(1, int(self.street_width_inches * DPI))
+
+    @property
+    def printable_width(self) -> int:
+        return self.page_width - 2 * self.margin
+
+    @property
+    def printable_height(self) -> int:
+        return self.page_height - 2 * self.margin
+
+    def __getattr__(self, name):
+        # Backward compat for old pickled PageSettings that may lack new fields
+        defaults = {
+            'paper_size_index': 0,
+            'margin_inches': 0.25,
+            'cut_line_style': 1,
+            'street_width_inches': 0.125,
+        }
+        if name in defaults:
+            return defaults[name]
+        raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
 
 @dataclass
 class StickerImage:
@@ -82,6 +140,13 @@ class StickerProject:
     """Full project state. Pickle-serializable."""
     images: list[StickerImage] = field(default_factory=list)
     layout: LayoutResult = field(default_factory=LayoutResult)
+    settings: PageSettings = field(default_factory=PageSettings)
+
+    def __getattr__(self, name):
+        # Backward compat: old pickled instances lack settings
+        if name == 'settings':
+            return PageSettings()
+        raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
 
 
 # === Tiler: log-scale sizing, row quantization, row packing, scale-to-fit ===
@@ -89,10 +154,12 @@ class StickerProject:
 class Tiler:
     """Layout engine implementing the row-based tiling algorithm."""
 
-    def __init__(self):
-        self.pw = PRINTABLE_WIDTH
-        self.ph = PRINTABLE_HEIGHT
-        self.gap = CUT_GAP
+    def __init__(self, settings: PageSettings | None = None):
+        s = settings or PageSettings()
+        self.pw = s.printable_width
+        self.ph = s.printable_height
+        self.gap = s.cut_gap
+        self.margin = s.margin
 
     def layout(self, images: list[StickerImage]) -> LayoutResult:
         """Run the full layout pipeline on the given images."""
@@ -215,10 +282,10 @@ class Tiler:
 
         # Build final layout with absolute positions
         layout_rows = []
-        y = MARGIN
+        y = self.margin
         for row_h, items in rows:
             placements = [
-                PlacedImage(image_index=idx, x=MARGIN + x, y=y, width=w, height=row_h)
+                PlacedImage(image_index=idx, x=self.margin + x, y=y, width=w, height=row_h)
                 for x, w, idx in items
             ]
             layout_rows.append(LayoutRow(y=y, height=row_h, placements=placements))
@@ -260,12 +327,18 @@ class PageWidget(QWidget):
             self._pixmap_cache[index] = QPixmap.fromImage(qimg)
         return self._pixmap_cache[index]
 
+    def _page_w(self) -> int:
+        return self.project.settings.page_width
+
+    def _page_h(self) -> int:
+        return self.project.settings.page_height
+
     def _base_scale(self) -> float:
         """Scale factor to fit the page into the widget at zoom=1."""
         padding = 20
         w = max(1, self.width() - 2 * padding)
         h = max(1, self.height() - 2 * padding)
-        return min(w / PAGE_WIDTH, h / PAGE_HEIGHT)
+        return min(w / self._page_w(), h / self._page_h())
 
     def page_scale(self) -> float:
         """Compute the scale factor from 300 DPI page coords to screen pixels."""
@@ -274,8 +347,8 @@ class PageWidget(QWidget):
     def _page_origin(self) -> tuple[float, float]:
         """Top-left corner of the page on screen, centered in widget with pan offset."""
         scale = self.page_scale()
-        pw = PAGE_WIDTH * scale
-        ph = PAGE_HEIGHT * scale
+        pw = self._page_w() * scale
+        ph = self._page_h() * scale
         return (self.width() - pw) / 2 + self._pan.x(), (self.height() - ph) / 2 + self._pan.y()
 
     def reset_view(self):
@@ -289,6 +362,10 @@ class PageWidget(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
 
+        s = self.project.settings
+        page_w = s.page_width
+        page_h = s.page_height
+
         # Widget background
         painter.fillRect(self.rect(), QColor(200, 200, 200))
 
@@ -297,19 +374,19 @@ class PageWidget(QWidget):
 
         # Page shadow
         painter.fillRect(
-            QRectF(ox + 3, oy + 3, PAGE_WIDTH * scale, PAGE_HEIGHT * scale),
+            QRectF(ox + 3, oy + 3, page_w * scale, page_h * scale),
             QColor(150, 150, 150),
         )
         # White page
         painter.fillRect(
-            QRectF(ox, oy, PAGE_WIDTH * scale, PAGE_HEIGHT * scale),
+            QRectF(ox, oy, page_w * scale, page_h * scale),
             QColor(255, 255, 255),
         )
         # Margin guides (faint dashed rectangle)
         painter.setPen(QPen(QColor(230, 230, 230), 1, Qt.PenStyle.DashLine))
-        m = MARGIN * scale
+        m = s.margin * scale
         painter.drawRect(QRectF(ox + m, oy + m,
-                                PRINTABLE_WIDTH * scale, PRINTABLE_HEIGHT * scale))
+                                s.printable_width * scale, s.printable_height * scale))
 
         layout = self.project.layout
         if layout and layout.rows:
@@ -327,10 +404,20 @@ class PageWidget(QWidget):
             painter.drawPixmap(dest.toRect(), pix)
 
     def _paint_cut_lines(self, painter, layout, scale, ox, oy):
-        painter.setPen(QPen(QColor(180, 180, 180), 1, Qt.PenStyle.DashLine))
+        s = self.project.settings
+        style_name = CUT_LINE_STYLES[s.cut_line_style]
+        if style_name == "None":
+            return
+        pen_style = {
+            "Dashed": Qt.PenStyle.DashLine,
+            "Dotted": Qt.PenStyle.DotLine,
+            "Solid": Qt.PenStyle.SolidLine,
+        }[style_name]
+        painter.setPen(QPen(QColor(180, 180, 180), 1, pen_style))
 
-        left = ox + MARGIN * scale
-        right = ox + (PAGE_WIDTH - MARGIN) * scale
+        margin = s.margin
+        left = ox + margin * scale
+        right = ox + (s.page_width - margin) * scale
 
         # Horizontal cut lines between rows (span full printable width)
         for i in range(1, len(layout.rows)):
@@ -406,8 +493,8 @@ class PageWidget(QWidget):
                 # Adjust pan so the point under cursor stays fixed
                 new_ox = mouse_pos.x() - rel_x * scale_ratio
                 new_oy = mouse_pos.y() - rel_y * scale_ratio
-                base_ox = (self.width() - PAGE_WIDTH * new_scale) / 2
-                base_oy = (self.height() - PAGE_HEIGHT * new_scale) / 2
+                base_ox = (self.width() - self._page_w() * new_scale) / 2
+                base_oy = (self.height() - self._page_h() * new_scale) / 2
                 self._pan = QPointF(new_ox - base_ox, new_oy - base_oy)
 
                 self.zoom_changed.emit()
@@ -590,6 +677,76 @@ class DeleteImageCommand(QUndoCommand):
         self._window._retile()
 
 
+# === Settings Dialog ===
+
+class SettingsDialog(QDialog):
+    """Dialog for configuring page layout settings."""
+
+    def __init__(self, settings: PageSettings, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.setMinimumWidth(350)
+
+        layout = QVBoxLayout(self)
+
+        # --- Page group ---
+        page_group = QGroupBox("Page")
+        page_form = QFormLayout(page_group)
+
+        self._paper_combo = QComboBox()
+        for name, _, _ in PAPER_SIZES:
+            self._paper_combo.addItem(name)
+        self._paper_combo.setCurrentIndex(settings.paper_size_index)
+        page_form.addRow("Paper size:", self._paper_combo)
+
+        self._margin_spin = QDoubleSpinBox()
+        self._margin_spin.setRange(0.0, 2.0)
+        self._margin_spin.setSingleStep(0.125)
+        self._margin_spin.setDecimals(3)
+        self._margin_spin.setSuffix(" in")
+        self._margin_spin.setValue(settings.margin_inches)
+        page_form.addRow("Margins:", self._margin_spin)
+
+        layout.addWidget(page_group)
+
+        # --- Cutting group ---
+        cut_group = QGroupBox("Cutting")
+        cut_form = QFormLayout(cut_group)
+
+        self._street_spin = QDoubleSpinBox()
+        self._street_spin.setRange(0.0, 1.0)
+        self._street_spin.setSingleStep(0.0625)
+        self._street_spin.setDecimals(4)
+        self._street_spin.setSuffix(" in")
+        self._street_spin.setValue(settings.street_width_inches)
+        cut_form.addRow("Street width:", self._street_spin)
+
+        self._cut_style_combo = QComboBox()
+        for style in CUT_LINE_STYLES:
+            self._cut_style_combo.addItem(style)
+        self._cut_style_combo.setCurrentIndex(settings.cut_line_style)
+        cut_form.addRow("Cut line style:", self._cut_style_combo)
+
+        layout.addWidget(cut_group)
+
+        # --- Buttons ---
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def result_settings(self) -> PageSettings:
+        """Return a PageSettings reflecting the dialog's current values."""
+        return PageSettings(
+            paper_size_index=self._paper_combo.currentIndex(),
+            margin_inches=self._margin_spin.value(),
+            cut_line_style=self._cut_style_combo.currentIndex(),
+            street_width_inches=self._street_spin.value(),
+        )
+
+
 # === MainWindow ===
 
 class MainWindow(QMainWindow):
@@ -598,7 +755,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.project = StickerProject()
-        self.tiler = Tiler()
+        self.tiler = Tiler(self.project.settings)
         self._file_path: str | None = None
         self._dirty = False
         self._undo_stack = QUndoStack(self)
@@ -695,6 +852,12 @@ class MainWindow(QMainWindow):
 
         act = QAction("Clear &All", self)
         act.triggered.connect(self._clear_all)
+        edit_menu.addAction(act)
+
+        edit_menu.addSeparator()
+
+        act = QAction("Se&ttings...", self)
+        act.triggered.connect(self._show_settings)
         edit_menu.addAction(act)
 
     # --- Dirty state ---
@@ -837,6 +1000,8 @@ class MainWindow(QMainWindow):
             return
         self.project.images.clear()
         self.project.layout = LayoutResult()
+        self.project.settings = PageSettings()
+        self.tiler = Tiler(self.project.settings)
         self._file_path = None
         self._undo_stack.clear()
         self._undo_stack.setClean()
@@ -860,6 +1025,20 @@ class MainWindow(QMainWindow):
         self.page_widget.update()
         self._mark_dirty()
         self._update_status()
+
+    # --- Settings ---
+
+    def _show_settings(self):
+        dlg = SettingsDialog(self.project.settings, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.project.settings = dlg.result_settings()
+            self._apply_settings()
+            self._mark_dirty()
+
+    def _apply_settings(self):
+        """Rebuild tiler from current settings and re-layout."""
+        self.tiler = Tiler(self.project.settings)
+        self._retile()
 
     # --- Save / Load (Phase 5) ---
 
@@ -908,6 +1087,8 @@ class MainWindow(QMainWindow):
             return
         self.project.images = proj.images
         self.project.layout = proj.layout
+        self.project.settings = proj.settings
+        self.tiler = Tiler(self.project.settings)
         self._file_path = path
         self._undo_stack.clear()
         self._undo_stack.setClean()
