@@ -8,7 +8,7 @@ import sys
 from dataclasses import dataclass, field
 
 from PIL import Image
-from PySide6.QtCore import Qt, QRectF, QPointF, QByteArray, QBuffer, QIODevice, Signal
+from PySide6.QtCore import Qt, QRectF, QPointF, QByteArray, QBuffer, QIODevice, QEvent, Signal
 from PySide6.QtGui import (
     QAction, QImage, QPixmap, QPainter, QPen, QColor, QKeySequence, QUndoStack, QUndoCommand,
 )
@@ -738,6 +738,10 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Open Sticker Sheet", "", STICKER_FILTER)
         if not path:
             return
+        self.open_file(path)
+
+    def open_file(self, path: str):
+        """Open a .sticker file by path. Used by File>Open, argv, and macOS QFileOpenEvent."""
         try:
             with open(path, "rb") as f:
                 proj = pickle.load(f)  # noqa: S301
@@ -823,22 +827,45 @@ class MainWindow(QMainWindow):
             event.ignore()
 
 
+# === StickerApp: custom QApplication for macOS file open events ===
+
+class StickerApp(QApplication):
+    """QApplication subclass that handles macOS QFileOpenEvent."""
+
+    file_open_requested = Signal(str)
+
+    def event(self, event):
+        if event.type() == QEvent.Type.FileOpen:
+            self.file_open_requested.emit(event.file())
+            return True
+        return super().event(event)
+
+
 # === Entry Point ===
 
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Sticker Sheet Maker")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument("file", nargs="?", default=None, help="Open a .sticker file")
     args = parser.parse_args()
 
     if args.debug:
         import logging
         logging.basicConfig(level=logging.DEBUG)
 
-    app = QApplication(sys.argv)
+    app = StickerApp(sys.argv)
     app.setApplicationName("Sticker Sheet Maker")
     window = MainWindow()
     window.show()
+
+    # Connect macOS file-open events (double-click .sticker in Finder)
+    app.file_open_requested.connect(window.open_file)
+
+    # Handle command-line file argument
+    if args.file:
+        window.open_file(args.file)
+
     sys.exit(app.exec())
 
 
