@@ -38,6 +38,7 @@ OPTIONS = {
         }],
     },
     'packages': ['PySide6', 'PIL'],
+    'strip': False,  # avoid "Operation not permitted" on macOS SIP-protected binaries
 }
 
 setup(

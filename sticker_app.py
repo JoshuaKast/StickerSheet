@@ -4,6 +4,7 @@
 import io
 import math
 import pickle
+import re
 import sys
 import urllib.parse
 import urllib.request
@@ -168,29 +169,38 @@ class Tiler:
             return LayoutResult()
 
         # Step 1: Log-scale sizing — dampen resolution differences
+        # Use log-scale on the geometric mean of dimensions to get an overall
+        # "ideal size", then distribute width/height by the actual aspect ratio.
+        # This prevents tall rows for wide images (the old approach applied log2
+        # independently to width and height, which made all images roughly square
+        # in ideal-space regardless of their actual aspect ratio).
         raw_ideal = []
         for img in images:
-            iw = math.log2(img.pixel_width + 1)
-            ih = math.log2(img.pixel_height + 1)
+            pw, ph = img.pixel_width, img.pixel_height
+            geo_mean = math.sqrt(pw * ph) if pw > 0 and ph > 0 else max(pw, ph, 1)
+            ideal_size = math.log2(geo_mean + 1)
+            aspect = pw / ph if ph > 0 else 1.0
+            # Distribute: iw * ih == ideal_size^2, iw/ih == aspect
+            ih = ideal_size / math.sqrt(aspect) if aspect > 0 else ideal_size
+            iw = ih * aspect
             raw_ideal.append((iw, ih))
 
         # Step 2: Quantize heights into row bins (from UNSCALED ideals for stability)
         n_bins = self._bin_count(len(images))
         bins = self._compute_bins([ih for _, ih in raw_ideal], n_bins)
 
-        # Step 3: Apply per-image scale_step, then snap to nearest bin.
-        # Each step ≈ 1.2x size change. This naturally bumps images into
-        # adjacent bins when the scaling crosses a bin boundary.
-        groups: dict[float, list[tuple[float, int]]] = {}
+        # Step 3: Assign images to bins based on unscaled ideal heights.
+        # Per-image scale_step is carried through as a multiplier applied
+        # during packing, so it always produces a visible size change even
+        # when there's only one bin.
+        # groups: bin_h -> list of (ideal_w, image_index, per_image_factor)
+        groups: dict[float, list[tuple[float, int, float]]] = {}
         for i, (iw, ih) in enumerate(raw_ideal):
             step = getattr(images[i], 'scale_step', 0)
-            if step != 0:
-                factor = 1.2 ** step
-                iw *= factor
-                ih *= factor
+            factor = 1.2 ** step if step != 0 else 1.0
             best_bin = min(bins, key=lambda b: abs(b - ih))
             scaled_w = iw * (best_bin / ih) if ih > 0 else iw
-            groups.setdefault(best_bin, []).append((scaled_w, i))
+            groups.setdefault(best_bin, []).append((scaled_w, i, factor))
 
         # Step 4: Pack rows with scale-to-fit via binary search
         return self._scale_to_fit(groups)
@@ -254,27 +264,31 @@ class Tiler:
         for bin_h in sorted(groups.keys(), reverse=True):
             row_h = max(1, int(bin_h * scale))
 
-            current: list[tuple[int, int, int]] = []  # (x, width, image_index)
+            current: list[tuple[int, int, int, int]] = []  # (x, width, height, image_index)
             cx = 0
 
-            for ideal_w, idx in groups[bin_h]:
-                w = max(1, int(ideal_w * scale))
+            for ideal_w, idx, img_factor in groups[bin_h]:
+                w = max(1, int(ideal_w * scale * img_factor))
+                h = max(1, int(bin_h * scale * img_factor))
                 if w > self.pw:
                     w = self.pw
 
                 needed = cx + (self.gap if current else 0) + w
                 if needed > self.pw and current:
-                    rows.append((row_h, current))
+                    # Row height = tallest image in the row
+                    actual_row_h = max(item_h for _, _, item_h, _ in current)
+                    rows.append((actual_row_h, current))
                     current = []
                     cx = 0
 
                 if current:
                     cx += self.gap
-                current.append((cx, w, idx))
+                current.append((cx, w, h, idx))
                 cx += w
 
             if current:
-                rows.append((row_h, current))
+                actual_row_h = max(item_h for _, _, item_h, _ in current)
+                rows.append((actual_row_h, current))
 
         # Check vertical fit
         total = sum(h for h, _ in rows) + self.gap * max(0, len(rows) - 1)
@@ -286,8 +300,8 @@ class Tiler:
         y = self.margin
         for row_h, items in rows:
             placements = [
-                PlacedImage(image_index=idx, x=self.margin + x, y=y, width=w, height=row_h)
-                for x, w, idx in items
+                PlacedImage(image_index=idx, x=self.margin + x, y=y, width=w, height=h)
+                for x, w, h, idx in items
             ]
             layout_rows.append(LayoutRow(y=y, height=row_h, placements=placements))
             y += row_h + self.gap
@@ -434,11 +448,31 @@ class PageWidget(QWidget):
 
         painter.end()
 
+    @staticmethod
+    def _fit_rect(cell: QRectF, src_w: float, src_h: float) -> QRectF:
+        """Return the largest rect with src aspect ratio that fits inside cell, centered."""
+        if src_w <= 0 or src_h <= 0:
+            return cell
+        src_aspect = src_w / src_h
+        cell_aspect = cell.width() / cell.height() if cell.height() > 0 else 1
+        if src_aspect > cell_aspect:
+            # Image is wider than cell — fit to width
+            w = cell.width()
+            h = w / src_aspect
+        else:
+            # Image is taller (or equal) — fit to height
+            h = cell.height()
+            w = h * src_aspect
+        x = cell.x() + (cell.width() - w) / 2
+        y = cell.y() + (cell.height() - h) / 2
+        return QRectF(x, y, w, h)
+
     def _paint_images(self, painter, layout, scale, ox, oy):
         for placed in layout.placements:
             pix = self._get_pixmap(placed.image_index)
-            dest = QRectF(ox + placed.x * scale, oy + placed.y * scale,
+            cell = QRectF(ox + placed.x * scale, oy + placed.y * scale,
                           placed.width * scale, placed.height * scale)
+            dest = self._fit_rect(cell, pix.width(), pix.height())
             painter.drawPixmap(dest.toRect(), pix)
 
     def _paint_cut_lines(self, painter, layout, scale, ox, oy):
@@ -598,7 +632,16 @@ class PageWidget(QWidget):
     def dropEvent(self, event):
         mime = event.mimeData()
         added = False
-        if mime.hasUrls():
+
+        # 1. Try image data first (some browsers include the actual bitmap)
+        if mime.hasImage():
+            qimg = QImage(mime.imageData())
+            if not qimg.isNull():
+                self._add_qimage(qimg)
+                added = True
+
+        # 2. Try URLs (local files or remote image URLs)
+        if not added and mime.hasUrls():
             for url in mime.urls():
                 path = url.toLocalFile()
                 if path:
@@ -607,23 +650,28 @@ class PageWidget(QWidget):
                 elif url.scheme() in ("http", "https"):
                     if self._load_url(url.toString()):
                         added = True
-        elif mime.hasImage():
-            qimg = QImage(mime.imageData())
-            if not qimg.isNull():
-                self._add_qimage(qimg)
-                added = True
-        elif mime.hasText():
+
+        # 3. Try HTML — browsers often provide text/html with <img src="...">
+        if not added and mime.hasHtml():
+            for img_url in self._extract_img_urls(mime.html()):
+                if self._load_url(img_url):
+                    added = True
+                    break
+
+        # 4. Try plain text as a URL
+        if not added and mime.hasText():
             text = mime.text().strip()
             if text.startswith(("http://", "https://")):
                 if self._load_url(text):
                     added = True
+
         if added:
             self.images_changed.emit()
         event.acceptProposedAction()
 
     def dragEnterEvent(self, event):
         mime = event.mimeData()
-        if mime.hasImage() or mime.hasUrls() or mime.hasText():
+        if mime.hasImage() or mime.hasUrls() or mime.hasHtml() or mime.hasText():
             event.acceptProposedAction()
 
     def _load_file(self, path: str) -> bool:
@@ -666,6 +714,18 @@ class PageWidget(QWidget):
             return urllib.parse.urlunparse(parsed._replace(path=path))
 
         return url
+
+    @staticmethod
+    def _extract_img_urls(html: str) -> list[str]:
+        """Extract image URLs from HTML img tags (e.g. browser drag MIME data)."""
+        urls = re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', html, re.IGNORECASE)
+        # Also check srcset for higher-res variants
+        for match in re.finditer(r'<img[^>]+srcset=["\']([^"\']+)["\']', html, re.IGNORECASE):
+            # srcset format: "url1 1x, url2 2x" — take the last (highest-res) entry
+            entries = [e.strip().split()[0] for e in match.group(1).split(",") if e.strip()]
+            if entries:
+                urls.insert(0, entries[-1])  # prefer highest-res
+        return [u for u in urls if u.startswith(("http://", "https://"))]
 
     def _load_url(self, url: str) -> bool:
         """Download an image from a URL and add it to the project.
@@ -950,7 +1010,12 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(act)
 
         self._delete_action = QAction("&Delete Selected", self)
-        self._delete_action.setShortcut(QKeySequence.StandardKey.Delete)
+        # On macOS, the key labeled "delete" sends Backspace, not forward-delete.
+        # Map both so the action works with either key.
+        self._delete_action.setShortcuts([
+            QKeySequence.StandardKey.Delete,
+            QKeySequence(Qt.Key.Key_Backspace),
+        ])
         self._delete_action.triggered.connect(self._delete_selected)
         self._delete_action.setEnabled(False)
         edit_menu.addAction(self._delete_action)
@@ -1045,16 +1110,23 @@ class MainWindow(QMainWindow):
     # --- Actions ---
 
     def _paste(self):
-        """Paste image from clipboard via undo stack."""
+        """Paste image from clipboard via undo stack.
+
+        Tries in order: image data, raw image MIME formats, HTML with <img> tags,
+        plain text URL.
+        """
         cb = QApplication.clipboard()
         mime = cb.mimeData()
 
         sticker = None
+
+        # 1. Direct image data
         if mime.hasImage():
             qimg = cb.image()
             if not qimg.isNull():
                 sticker = self.page_widget._qimage_to_sticker(qimg)
 
+        # 2. Raw image MIME formats (e.g. image/png bytes)
         if sticker is None:
             for fmt in mime.formats():
                 if "image" in fmt.lower():
@@ -1066,6 +1138,46 @@ class MainWindow(QMainWindow):
                             break
                         except Exception:
                             continue
+
+        # 3. HTML with <img src="..."> (e.g. copied image from browser)
+        if sticker is None and mime.hasHtml():
+            for img_url in PageWidget._extract_img_urls(mime.html()):
+                try:
+                    upgraded = PageWidget._upgrade_url(img_url)
+                    for attempt_url in ([upgraded, img_url] if upgraded != img_url else [img_url]):
+                        try:
+                            req = urllib.request.Request(
+                                attempt_url, headers={"User-Agent": "StickerSheet/1.0"})
+                            with urllib.request.urlopen(req, timeout=10) as resp:
+                                raw = resp.read(10 * 1024 * 1024)
+                            pil_img = Image.open(io.BytesIO(raw))
+                            pil_img.load()
+                            sticker = self.page_widget._pil_to_sticker(pil_img)
+                            break
+                        except Exception:
+                            continue
+                    if sticker:
+                        break
+                except Exception:
+                    continue
+
+        # 4. Plain text URL (e.g. copied image address)
+        if sticker is None and mime.hasText():
+            text = mime.text().strip()
+            if text.startswith(("http://", "https://")):
+                upgraded = PageWidget._upgrade_url(text)
+                for attempt_url in ([upgraded, text] if upgraded != text else [text]):
+                    try:
+                        req = urllib.request.Request(
+                            attempt_url, headers={"User-Agent": "StickerSheet/1.0"})
+                        with urllib.request.urlopen(req, timeout=10) as resp:
+                            raw = resp.read(10 * 1024 * 1024)
+                        pil_img = Image.open(io.BytesIO(raw))
+                        pil_img.load()
+                        sticker = self.page_widget._pil_to_sticker(pil_img)
+                        break
+                    except Exception:
+                        continue
 
         if sticker:
             self._undo_stack.push(PasteImageCommand(self, sticker))
@@ -1296,7 +1408,8 @@ class MainWindow(QMainWindow):
         for placed in layout.placements:
             qimg = QImage()
             qimg.loadFromData(self.project.images[placed.image_index].png_data)
-            dest = QRectF(placed.x, placed.y, placed.width, placed.height)
+            cell = QRectF(placed.x, placed.y, placed.width, placed.height)
+            dest = PageWidget._fit_rect(cell, qimg.width(), qimg.height())
             painter.drawImage(dest, qimg)
 
         painter.end()
