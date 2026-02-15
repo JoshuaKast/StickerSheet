@@ -4,9 +4,9 @@ import math
 from sticker_app import Tiler, StickerImage, MARGIN, PRINTABLE_WIDTH, PRINTABLE_HEIGHT, CUT_GAP
 
 
-def _make_sticker(pw, ph):
+def _make_sticker(pw, ph, mask=None):
     """Create a StickerImage with given pixel dimensions (no actual image data needed for Tiler)."""
-    return StickerImage(png_data=b'', pixel_width=pw, pixel_height=ph)
+    return StickerImage(png_data=b'', pixel_width=pw, pixel_height=ph, mask=mask)
 
 
 class TestLogScaleSizing:
@@ -141,3 +141,46 @@ class TestScaleToFit:
         for p in result.placements:
             assert p.width <= PRINTABLE_WIDTH
             assert p.height <= PRINTABLE_HEIGHT
+
+
+class TestMask:
+    """Mask (crop) feature: effective dimensions affect layout."""
+
+    def test_effective_dimensions_no_mask(self):
+        img = _make_sticker(1000, 500)
+        assert img.effective_width == 1000
+        assert img.effective_height == 500
+
+    def test_effective_dimensions_with_mask(self):
+        img = _make_sticker(1000, 1000, mask=(100, 100, 800, 400))
+        assert img.effective_width == 800
+        assert img.effective_height == 400
+
+    def test_masked_image_aspect_ratio_in_layout(self):
+        """A square image masked to 2:1 should produce a wider-than-tall placement."""
+        tiler = Tiler()
+        img = _make_sticker(1000, 1000, mask=(0, 0, 1000, 500))
+        result = tiler.layout([img])
+        assert len(result.placements) == 1
+        p = result.placements[0]
+        assert p.width > p.height, "Masked 2:1 image should be wider than tall"
+
+    def test_mask_none_same_as_no_mask(self):
+        """mask=None should produce same layout as no mask."""
+        tiler = Tiler()
+        img_no_mask = _make_sticker(500, 300)
+        img_none_mask = _make_sticker(500, 300, mask=None)
+        r1 = tiler.layout([img_no_mask])
+        r2 = tiler.layout([img_none_mask])
+        p1, p2 = r1.placements[0], r2.placements[0]
+        assert p1.width == p2.width
+        assert p1.height == p2.height
+
+    def test_masked_images_fit_page(self):
+        """Masked images should still fit within page bounds."""
+        tiler = Tiler()
+        images = [_make_sticker(1000, 1000, mask=(0, 0, 1000, 200)) for _ in range(15)]
+        result = tiler.layout(images)
+        assert len(result.placements) == 15
+        for p in result.placements:
+            assert p.y + p.height <= MARGIN + PRINTABLE_HEIGHT + 1

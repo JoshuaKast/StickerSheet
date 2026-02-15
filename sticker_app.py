@@ -11,14 +11,15 @@ import urllib.request
 from dataclasses import dataclass, field
 
 from PIL import Image
-from PySide6.QtCore import Qt, QRectF, QPointF, QByteArray, QBuffer, QIODevice, QEvent, Signal
+from PySide6.QtCore import Qt, QRect, QRectF, QPointF, QByteArray, QBuffer, QIODevice, QEvent, Signal
 from PySide6.QtGui import (
     QAction, QImage, QPixmap, QPainter, QPen, QColor, QKeySequence, QUndoStack, QUndoCommand,
 )
 from PySide6.QtPrintSupport import QPrintDialog, QPrinter
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QStatusBar, QFileDialog, QMessageBox, QMenu,
-    QDialog, QDialogButtonBox, QFormLayout, QComboBox, QDoubleSpinBox, QVBoxLayout, QGroupBox,
+    QDialog, QDialogButtonBox, QFormLayout, QComboBox, QDoubleSpinBox, QVBoxLayout, QHBoxLayout,
+    QGroupBox, QPushButton,
 )
 
 
@@ -53,7 +54,7 @@ class PageSettings:
     """Configurable page layout settings."""
     paper_size_index: int = 0          # Index into PAPER_SIZES
     margin_inches: float = 0.25        # Margin on all sides, in inches
-    cut_line_style: int = 1            # Index into CUT_LINE_STYLES (default: Dashed)
+    cut_line_style: int = 0            # Index into CUT_LINE_STYLES (default: None)
     street_width_inches: float = 0.125  # Min gap between images, in inches (1/8")
 
     @property
@@ -101,11 +102,27 @@ class StickerImage:
     pixel_width: int
     pixel_height: int
     scale_step: int = 0  # Per-image scaling: each step ≈ 20% size change
+    mask: tuple[int, int, int, int] | None = None  # (x, y, w, h) crop rect in pixel coords
+
+    @property
+    def effective_width(self) -> int:
+        """Width after mask is applied. Used by tiler for layout."""
+        if self.mask is not None:
+            return self.mask[2]
+        return self.pixel_width
+
+    @property
+    def effective_height(self) -> int:
+        """Height after mask is applied. Used by tiler for layout."""
+        if self.mask is not None:
+            return self.mask[3]
+        return self.pixel_height
 
     def __getattr__(self, name):
-        # Backward compat: old pickled instances lack scale_step
-        if name == 'scale_step':
-            return 0
+        # Backward compat: old pickled instances may lack these fields
+        defaults = {'scale_step': 0, 'mask': None}
+        if name in defaults:
+            return defaults[name]
         raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
 
 
@@ -176,7 +193,7 @@ class Tiler:
         # in ideal-space regardless of their actual aspect ratio).
         raw_ideal = []
         for img in images:
-            pw, ph = img.pixel_width, img.pixel_height
+            pw, ph = img.effective_width, img.effective_height
             geo_mean = math.sqrt(pw * ph) if pw > 0 and ph > 0 else max(pw, ph, 1)
             ideal_size = math.log2(geo_mean + 1)
             aspect = pw / ph if ph > 0 else 1.0
@@ -314,9 +331,10 @@ class Tiler:
 class PageWidget(QWidget):
     """Draws the US Letter page with tiled sticker images and cut lines."""
 
-    images_changed = Signal()
+    images_changed = Signal(list)  # emits list of StickerImage objects from drop
     selection_changed = Signal()
     zoom_changed = Signal()
+    mask_edit_requested = Signal(int)  # emits image index
 
     def __init__(self, project: StickerProject, parent=None):
         super().__init__(parent)
@@ -470,10 +488,18 @@ class PageWidget(QWidget):
     def _paint_images(self, painter, layout, scale, ox, oy):
         for placed in layout.placements:
             pix = self._get_pixmap(placed.image_index)
+            img = self.project.images[placed.image_index]
+            mask = getattr(img, 'mask', None)
             cell = QRectF(ox + placed.x * scale, oy + placed.y * scale,
                           placed.width * scale, placed.height * scale)
-            dest = self._fit_rect(cell, pix.width(), pix.height())
-            painter.drawPixmap(dest.toRect(), pix)
+            if mask is not None:
+                mx, my, mw, mh = mask
+                source = QRectF(mx, my, mw, mh)
+                dest = self._fit_rect(cell, mw, mh)
+                painter.drawPixmap(dest, pix, source)
+            else:
+                dest = self._fit_rect(cell, pix.width(), pix.height())
+                painter.drawPixmap(dest.toRect(), pix)
 
     def _paint_cut_lines(self, painter, layout, scale, ox, oy):
         s = self.project.settings
@@ -624,6 +650,15 @@ class PageWidget(QWidget):
         else:
             super().mouseReleaseEvent(event)
 
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            hit = self._hit_test(event.position())
+            if hit is not None:
+                self.mask_edit_requested.emit(hit)
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
+
     # --- Drag and drop ---
 
     def dragMoveEvent(self, event):
@@ -631,42 +666,45 @@ class PageWidget(QWidget):
 
     def dropEvent(self, event):
         mime = event.mimeData()
-        added = False
+        stickers: list[StickerImage] = []
 
         # 1. Try image data first (some browsers include the actual bitmap)
         if mime.hasImage():
             qimg = QImage(mime.imageData())
             if not qimg.isNull():
-                self._add_qimage(qimg)
-                added = True
+                stickers.append(self._qimage_to_sticker(qimg))
 
         # 2. Try URLs (local files or remote image URLs)
-        if not added and mime.hasUrls():
+        if not stickers and mime.hasUrls():
             for url in mime.urls():
                 path = url.toLocalFile()
                 if path:
-                    if self._load_file(path):
-                        added = True
+                    s = self._load_file_as_sticker(path)
+                    if s:
+                        stickers.append(s)
                 elif url.scheme() in ("http", "https"):
-                    if self._load_url(url.toString()):
-                        added = True
+                    s = self._load_url_as_sticker(url.toString())
+                    if s:
+                        stickers.append(s)
 
         # 3. Try HTML — browsers often provide text/html with <img src="...">
-        if not added and mime.hasHtml():
+        if not stickers and mime.hasHtml():
             for img_url in self._extract_img_urls(mime.html()):
-                if self._load_url(img_url):
-                    added = True
+                s = self._load_url_as_sticker(img_url)
+                if s:
+                    stickers.append(s)
                     break
 
         # 4. Try plain text as a URL
-        if not added and mime.hasText():
+        if not stickers and mime.hasText():
             text = mime.text().strip()
             if text.startswith(("http://", "https://")):
-                if self._load_url(text):
-                    added = True
+                s = self._load_url_as_sticker(text)
+                if s:
+                    stickers.append(s)
 
-        if added:
-            self.images_changed.emit()
+        if stickers:
+            self.images_changed.emit(stickers)
         event.acceptProposedAction()
 
     def dragEnterEvent(self, event):
@@ -674,14 +712,13 @@ class PageWidget(QWidget):
         if mime.hasImage() or mime.hasUrls() or mime.hasHtml() or mime.hasText():
             event.acceptProposedAction()
 
-    def _load_file(self, path: str) -> bool:
+    def _load_file_as_sticker(self, path: str) -> StickerImage | None:
         try:
             img = Image.open(path)
             img.load()
-            self._add_pil(img)
-            return True
+            return self._pil_to_sticker(img)
         except Exception:
-            return False
+            return None
 
     @staticmethod
     def _upgrade_url(url: str) -> str:
@@ -727,8 +764,8 @@ class PageWidget(QWidget):
                 urls.insert(0, entries[-1])  # prefer highest-res
         return [u for u in urls if u.startswith(("http://", "https://"))]
 
-    def _load_url(self, url: str) -> bool:
-        """Download an image from a URL and add it to the project.
+    def _load_url_as_sticker(self, url: str) -> StickerImage | None:
+        """Download an image from a URL and return as StickerImage.
 
         Tries to upgrade thumbnail/proxy URLs to full-resolution originals first
         (DuckDuckGo, Wikipedia). Falls back to the original URL on failure.
@@ -742,11 +779,10 @@ class PageWidget(QWidget):
                     data = resp.read(10 * 1024 * 1024)  # 10 MB limit
                 img = Image.open(io.BytesIO(data))
                 img.load()
-                self._add_pil(img)
-                return True
+                return self._pil_to_sticker(img)
             except Exception:
                 continue
-        return False
+        return None
 
     def _qimage_to_sticker(self, qimage: QImage) -> StickerImage:
         """Convert QImage to a StickerImage via Pillow normalization."""
@@ -767,13 +803,6 @@ class PageWidget(QWidget):
                             pixel_width=img.width,
                             pixel_height=img.height)
 
-    def _add_qimage(self, qimage: QImage):
-        """Convert QImage to PNG bytes and store in project."""
-        self.project.images.append(self._qimage_to_sticker(qimage))
-
-    def _add_pil(self, img: Image.Image):
-        """Normalize to RGBA PNG and store in project."""
-        self.project.images.append(self._pil_to_sticker(img))
 
 
 # === Undo Commands (Phase 6) ===
@@ -831,6 +860,27 @@ class DeleteImageCommand(QUndoCommand):
 
     def undo(self):
         self._window.project.images.insert(self._index, self._image)
+        self._window._retile()
+
+
+class MaskImageCommand(QUndoCommand):
+    """Undoable command: change an image's crop mask."""
+
+    def __init__(self, window: "MainWindow", index: int,
+                 old_mask: tuple[int, int, int, int] | None,
+                 new_mask: tuple[int, int, int, int] | None):
+        super().__init__("Edit Mask")
+        self._window = window
+        self._index = index
+        self._old_mask = old_mask
+        self._new_mask = new_mask
+
+    def redo(self):
+        self._window.project.images[self._index].mask = self._new_mask
+        self._window._retile()
+
+    def undo(self):
+        self._window.project.images[self._index].mask = self._old_mask
         self._window._retile()
 
 
@@ -904,6 +954,256 @@ class SettingsDialog(QDialog):
         )
 
 
+# === Mask Editor Dialog ===
+
+_HANDLE_SIZE = 8  # pixels, half-width of resize handles
+_MIN_MASK = 10    # minimum mask dimension in image pixels
+
+
+class _MaskCanvas(QWidget):
+    """Interactive canvas for drawing a crop rectangle over an image."""
+
+    def __init__(self, pixmap: QPixmap, mask_rect: QRect, parent=None):
+        super().__init__(parent)
+        self._pixmap = pixmap
+        self._mask = QRect(mask_rect)
+        self._drag_mode: str | None = None
+        self._drag_start = QPointF()
+        self._drag_start_mask = QRect()
+        self.setMinimumSize(300, 300)
+        self.setMouseTracking(True)
+
+    def mask_rect(self) -> QRect:
+        return QRect(self._mask)
+
+    def set_mask(self, r: QRect):
+        self._mask = QRect(r)
+        self.update()
+
+    # --- Coordinate mapping ---
+
+    def _image_to_widget(self, ix: float, iy: float) -> QPointF:
+        s, ox, oy = self._transform()
+        return QPointF(ox + ix * s, oy + iy * s)
+
+    def _widget_to_image(self, wx: float, wy: float) -> QPointF:
+        s, ox, oy = self._transform()
+        return QPointF((wx - ox) / s, (wy - oy) / s)
+
+    def _transform(self) -> tuple[float, float, float]:
+        """Return (scale, offset_x, offset_y) to fit image into widget."""
+        padding = 10
+        w = max(1, self.width() - 2 * padding)
+        h = max(1, self.height() - 2 * padding)
+        sx = w / max(1, self._pixmap.width())
+        sy = h / max(1, self._pixmap.height())
+        s = min(sx, sy)
+        ox = padding + (w - self._pixmap.width() * s) / 2
+        oy = padding + (h - self._pixmap.height() * s) / 2
+        return s, ox, oy
+
+    # --- Painting ---
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+
+        # Background
+        p.fillRect(self.rect(), QColor(60, 60, 60))
+
+        s, ox, oy = self._transform()
+        img_rect = QRectF(ox, oy, self._pixmap.width() * s, self._pixmap.height() * s)
+
+        # Draw full image
+        p.drawPixmap(img_rect.toRect(), self._pixmap)
+
+        # Dimmed overlay outside mask
+        mask_screen = QRectF(
+            ox + self._mask.x() * s, oy + self._mask.y() * s,
+            self._mask.width() * s, self._mask.height() * s,
+        )
+        dim = QColor(0, 0, 0, 120)
+        # Top
+        p.fillRect(QRectF(img_rect.x(), img_rect.y(),
+                          img_rect.width(), mask_screen.y() - img_rect.y()), dim)
+        # Bottom
+        p.fillRect(QRectF(img_rect.x(), mask_screen.bottom(),
+                          img_rect.width(), img_rect.bottom() - mask_screen.bottom()), dim)
+        # Left
+        p.fillRect(QRectF(img_rect.x(), mask_screen.y(),
+                          mask_screen.x() - img_rect.x(), mask_screen.height()), dim)
+        # Right
+        p.fillRect(QRectF(mask_screen.right(), mask_screen.y(),
+                          img_rect.right() - mask_screen.right(), mask_screen.height()), dim)
+
+        # Mask border
+        p.setPen(QPen(QColor(255, 255, 255), 2, Qt.PenStyle.DashLine))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(mask_screen)
+
+        # Resize handles
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255))
+        for hx, hy in self._handle_positions(mask_screen):
+            p.drawRect(QRectF(hx - _HANDLE_SIZE / 2, hy - _HANDLE_SIZE / 2,
+                              _HANDLE_SIZE, _HANDLE_SIZE))
+
+        p.end()
+
+    def _handle_positions(self, r: QRectF) -> list[tuple[float, float]]:
+        """Return screen positions for the 8 resize handles."""
+        cx, cy = r.center().x(), r.center().y()
+        return [
+            (r.left(), r.top()), (cx, r.top()), (r.right(), r.top()),
+            (r.left(), cy), (r.right(), cy),
+            (r.left(), r.bottom()), (cx, r.bottom()), (r.right(), r.bottom()),
+        ]
+
+    _HANDLE_NAMES = ["nw", "n", "ne", "w", "e", "sw", "s", "se"]
+    _HANDLE_CURSORS = {
+        "nw": Qt.CursorShape.SizeFDiagCursor, "se": Qt.CursorShape.SizeFDiagCursor,
+        "ne": Qt.CursorShape.SizeBDiagCursor, "sw": Qt.CursorShape.SizeBDiagCursor,
+        "n": Qt.CursorShape.SizeVerCursor, "s": Qt.CursorShape.SizeVerCursor,
+        "w": Qt.CursorShape.SizeHorCursor, "e": Qt.CursorShape.SizeHorCursor,
+        "move": Qt.CursorShape.SizeAllCursor,
+    }
+
+    def _hit_handle(self, pos: QPointF) -> str | None:
+        """Return handle name or 'move' if inside mask, else None."""
+        s, ox, oy = self._transform()
+        mask_screen = QRectF(
+            ox + self._mask.x() * s, oy + self._mask.y() * s,
+            self._mask.width() * s, self._mask.height() * s,
+        )
+        handles = self._handle_positions(mask_screen)
+        for i, (hx, hy) in enumerate(handles):
+            if abs(pos.x() - hx) <= _HANDLE_SIZE and abs(pos.y() - hy) <= _HANDLE_SIZE:
+                return self._HANDLE_NAMES[i]
+        if mask_screen.contains(pos):
+            return "move"
+        return None
+
+    # --- Mouse interaction ---
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            mode = self._hit_handle(event.position())
+            if mode is not None:
+                self._drag_mode = mode
+                self._drag_start = event.position()
+                self._drag_start_mask = QRect(self._mask)
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_mode is None:
+            # Update cursor based on hover
+            mode = self._hit_handle(event.position())
+            if mode and mode in self._HANDLE_CURSORS:
+                self.setCursor(self._HANDLE_CURSORS[mode])
+            else:
+                self.unsetCursor()
+            return
+
+        s, ox, oy = self._transform()
+        if s <= 0:
+            return
+
+        # Compute delta in image pixel coordinates
+        dx = (event.position().x() - self._drag_start.x()) / s
+        dy = (event.position().y() - self._drag_start.y()) / s
+        r = QRect(self._drag_start_mask)
+        iw, ih = self._pixmap.width(), self._pixmap.height()
+
+        if self._drag_mode == "move":
+            nx = int(r.x() + dx)
+            ny = int(r.y() + dy)
+            nx = max(0, min(nx, iw - r.width()))
+            ny = max(0, min(ny, ih - r.height()))
+            self._mask = QRect(nx, ny, r.width(), r.height())
+        else:
+            x1, y1, x2, y2 = r.x(), r.y(), r.x() + r.width(), r.y() + r.height()
+            mode = self._drag_mode
+            if "w" in mode:
+                x1 = max(0, min(int(r.x() + dx), x2 - _MIN_MASK))
+            if "e" in mode:
+                x2 = min(iw, max(int(r.x() + r.width() + dx), x1 + _MIN_MASK))
+            if "n" in mode:
+                y1 = max(0, min(int(r.y() + dy), y2 - _MIN_MASK))
+            if "s" in mode:
+                y2 = min(ih, max(int(r.y() + r.height() + dy), y1 + _MIN_MASK))
+            self._mask = QRect(x1, y1, x2 - x1, y2 - y1)
+
+        self.update()
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if self._drag_mode is not None:
+            self._drag_mode = None
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+
+class MaskEditorDialog(QDialog):
+    """Modal dialog for editing an image's crop mask."""
+
+    def __init__(self, png_data: bytes, img_w: int, img_h: int,
+                 current_mask: tuple[int, int, int, int] | None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit Mask")
+        self._img_w = img_w
+        self._img_h = img_h
+
+        pix = QPixmap()
+        pix.loadFromData(png_data)
+
+        if current_mask is not None:
+            init_rect = QRect(*current_mask)
+        else:
+            init_rect = QRect(0, 0, img_w, img_h)
+
+        layout = QVBoxLayout(self)
+
+        self._canvas = _MaskCanvas(pix, init_rect)
+        layout.addWidget(self._canvas, 1)
+
+        btn_row = QHBoxLayout()
+        reset_btn = QPushButton("Reset (Full Image)")
+        reset_btn.clicked.connect(self._reset_mask)
+        btn_row.addWidget(reset_btn)
+        btn_row.addStretch()
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        btn_row.addWidget(buttons)
+        layout.addLayout(btn_row)
+
+        # Size dialog to show image comfortably
+        max_w, max_h = 700, 700
+        aspect = img_w / img_h if img_h > 0 else 1.0
+        if aspect > 1:
+            dw = min(max_w, max(400, img_w))
+            dh = int(dw / aspect) + 80
+        else:
+            dh = min(max_h, max(400, img_h))
+            dw = int(dh * aspect) + 40
+        self.resize(max(400, dw), max(400, dh))
+
+    def _reset_mask(self):
+        self._canvas.set_mask(QRect(0, 0, self._img_w, self._img_h))
+
+    def result_mask(self) -> tuple[int, int, int, int] | None:
+        """Return the mask, or None if it covers the full image."""
+        r = self._canvas.mask_rect()
+        if r.x() == 0 and r.y() == 0 and r.width() == self._img_w and r.height() == self._img_h:
+            return None
+        return (r.x(), r.y(), r.width(), r.height())
+
+
 # === MainWindow ===
 
 class MainWindow(QMainWindow):
@@ -927,6 +1227,7 @@ class MainWindow(QMainWindow):
         self.page_widget.selection_changed.connect(self._on_selection_changed)
         self.page_widget.zoom_changed.connect(self._update_status)
         self.page_widget.customContextMenuRequested.connect(self._show_context_menu)
+        self.page_widget.mask_edit_requested.connect(self._edit_mask)
 
         self._build_menus()
         self._status = QStatusBar()
@@ -1020,6 +1321,12 @@ class MainWindow(QMainWindow):
         self._delete_action.setEnabled(False)
         edit_menu.addAction(self._delete_action)
 
+        self._mask_action = QAction("Edit &Mask...", self)
+        self._mask_action.setShortcut(QKeySequence("Ctrl+M"))
+        self._mask_action.triggered.connect(self._edit_mask_selected)
+        self._mask_action.setEnabled(False)
+        edit_menu.addAction(self._mask_action)
+
         edit_menu.addSeparator()
 
         act = QAction("Clear &All", self)
@@ -1105,6 +1412,7 @@ class MainWindow(QMainWindow):
     def _on_selection_changed(self):
         has_sel = self.page_widget.selected_index is not None
         self._delete_action.setEnabled(has_sel)
+        self._mask_action.setEnabled(has_sel)
         self._update_status()
 
     # --- Actions ---
@@ -1182,11 +1490,10 @@ class MainWindow(QMainWindow):
         if sticker:
             self._undo_stack.push(PasteImageCommand(self, sticker))
 
-    def _on_drop_images(self):
-        """Handle images added via drag-and-drop (already in project.images)."""
-        self._undo_stack.clear()  # can't undo drops; reset baseline
-        self._retile()
-        self._mark_dirty()
+    def _on_drop_images(self, stickers: list):
+        """Handle images added via drag-and-drop by pushing undo commands."""
+        for sticker in stickers:
+            self._undo_stack.push(PasteImageCommand(self, sticker))
 
     def _delete_selected(self):
         idx = self.page_widget.selected_index
@@ -1194,13 +1501,17 @@ class MainWindow(QMainWindow):
             self._undo_stack.push(DeleteImageCommand(self, idx))
 
     def _copy_selected(self):
-        """Copy the selected image back to clipboard."""
+        """Copy the selected image back to clipboard (masked region if cropped)."""
         idx = self.page_widget.selected_index
         if idx is None or idx >= len(self.project.images):
             return
-        data = self.project.images[idx].png_data
+        img = self.project.images[idx]
         qimg = QImage()
-        qimg.loadFromData(data)
+        qimg.loadFromData(img.png_data)
+        mask = getattr(img, 'mask', None)
+        if mask is not None:
+            mx, my, mw, mh = mask
+            qimg = qimg.copy(mx, my, mw, mh)
         if not qimg.isNull():
             QApplication.clipboard().setImage(qimg)
 
@@ -1213,6 +1524,24 @@ class MainWindow(QMainWindow):
         old_step = getattr(img, 'scale_step', 0)
         new_step = old_step + delta
         self._undo_stack.push(ScaleImageCommand(self, idx, old_step, new_step))
+
+    def _edit_mask_selected(self):
+        """Open the mask editor for the currently selected image."""
+        idx = self.page_widget.selected_index
+        if idx is not None:
+            self._edit_mask(idx)
+
+    def _edit_mask(self, index: int):
+        """Open the mask editor dialog for the image at the given index."""
+        if index < 0 or index >= len(self.project.images):
+            return
+        img = self.project.images[index]
+        old_mask = getattr(img, 'mask', None)
+        dlg = MaskEditorDialog(img.png_data, img.pixel_width, img.pixel_height, old_mask, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            new_mask = dlg.result_mask()
+            if new_mask != old_mask:
+                self._undo_stack.push(MaskImageCommand(self, index, old_mask, new_mask))
 
     def _show_context_menu(self, pos):
         idx = self.page_widget._hit_test(pos)
@@ -1235,6 +1564,13 @@ class MainWindow(QMainWindow):
         else:
             reset_scale_act = None
         menu.addSeparator()
+        mask_act = menu.addAction("Edit Mask...")
+        mask = getattr(img, 'mask', None)
+        if mask is not None:
+            clear_mask_act = menu.addAction("Clear Mask")
+        else:
+            clear_mask_act = None
+        menu.addSeparator()
         delete_act = menu.addAction("Delete")
         chosen = menu.exec(self.page_widget.mapToGlobal(pos))
         if chosen == copy_act:
@@ -1245,6 +1581,12 @@ class MainWindow(QMainWindow):
             self._scale_selected(-1)
         elif chosen == reset_scale_act:
             self._scale_selected(-step)
+        elif chosen == mask_act:
+            self._edit_mask(idx)
+        elif chosen == clear_mask_act:
+            old_mask = getattr(img, 'mask', None)
+            if old_mask is not None:
+                self._undo_stack.push(MaskImageCommand(self, idx, old_mask, None))
         elif chosen == delete_act:
             self._delete_selected()
 
@@ -1406,11 +1748,19 @@ class MainWindow(QMainWindow):
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
 
         for placed in layout.placements:
+            img = self.project.images[placed.image_index]
             qimg = QImage()
-            qimg.loadFromData(self.project.images[placed.image_index].png_data)
+            qimg.loadFromData(img.png_data)
             cell = QRectF(placed.x, placed.y, placed.width, placed.height)
-            dest = PageWidget._fit_rect(cell, qimg.width(), qimg.height())
-            painter.drawImage(dest, qimg)
+            mask = getattr(img, 'mask', None)
+            if mask is not None:
+                mx, my, mw, mh = mask
+                source = QRectF(mx, my, mw, mh)
+                dest = PageWidget._fit_rect(cell, mw, mh)
+                painter.drawImage(dest, qimg, source)
+            else:
+                dest = PageWidget._fit_rect(cell, qimg.width(), qimg.height())
+                painter.drawImage(dest, qimg)
 
         painter.end()
 
@@ -1436,9 +1786,11 @@ class MainWindow(QMainWindow):
         else:
             sel_text = ""
             if sel is not None and sel < n:
-                step = getattr(self.project.images[sel], 'scale_step', 0)
+                img = self.project.images[sel]
+                step = getattr(img, 'scale_step', 0)
                 scale_text = f" (scale: {'+' if step > 0 else ''}{step})" if step != 0 else ""
-                sel_text = f" | Selected: #{sel + 1}{scale_text}"
+                mask_text = " [cropped]" if getattr(img, 'mask', None) is not None else ""
+                sel_text = f" | Selected: #{sel + 1}{scale_text}{mask_text}"
             self._status.showMessage(
                 f"{n} image{'s' if n != 1 else ''}{sel_text} | Zoom: {zoom}%")
 

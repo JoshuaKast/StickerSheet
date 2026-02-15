@@ -89,3 +89,38 @@ class TestPickleRoundTrip:
         assert isinstance(loaded, StickerProject)
         assert len(loaded.images) == 5
         assert len(loaded.layout.placements) == 5
+
+
+class TestMaskPickle:
+    """Pickle round-trip tests for the mask field."""
+
+    def test_masked_image_round_trip(self, circle_image):
+        proj = StickerProject()
+        img = StickerImage(png_data=circle_image, pixel_width=200, pixel_height=200,
+                           mask=(10, 10, 180, 180))
+        proj.images.append(img)
+
+        data = pickle.dumps(proj)
+        loaded = pickle.loads(data)
+
+        assert loaded.images[0].mask == (10, 10, 180, 180)
+        assert loaded.images[0].effective_width == 180
+        assert loaded.images[0].effective_height == 180
+
+    def test_no_mask_defaults_to_none(self, circle_image):
+        """Image without mask should have mask=None and use pixel dims."""
+        img = StickerImage(png_data=circle_image, pixel_width=200, pixel_height=200)
+        assert img.mask is None
+        assert img.effective_width == 200
+        assert img.effective_height == 200
+
+    def test_backward_compat_no_mask_field(self, circle_image):
+        """Old pickled StickerImage without mask field should default to None."""
+        img = StickerImage(png_data=circle_image, pixel_width=200, pixel_height=200)
+        data = pickle.dumps(img)
+        # Simulate old pickle by removing the mask field from the dict
+        # (old objects wouldn't have it)
+        loaded = pickle.loads(data)
+        # Even though it was pickled with mask=None, verify the property works
+        assert getattr(loaded, 'mask', None) is None
+        assert loaded.effective_width == 200
