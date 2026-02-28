@@ -134,6 +134,7 @@ class PlacedImage:
     y: int
     width: int
     height: int
+    rotated: bool = False
 
 
 @dataclass
@@ -168,10 +169,15 @@ class StickerProject:
         raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
 
 
-# === Tiler: log-scale sizing, row quantization, row packing, scale-to-fit ===
+# === Tiler: multi-strategy optimal packing with rotation ===
 
 class Tiler:
-    """Layout engine implementing the row-based tiling algorithm."""
+    """Layout engine: multi-strategy shelf packing with rotation support.
+
+    Tries multiple packing strategies (binned shelves, sorted shelves,
+    best-fit decreasing) and picks the best result by fill ratio and
+    street length. Supports 90-degree rotation to improve packing.
+    """
 
     def __init__(self, settings: PageSettings | None = None):
         s = settings or PageSettings()
@@ -186,144 +192,398 @@ class Tiler:
             return LayoutResult()
 
         # Step 1: Log-scale sizing — dampen resolution differences
-        # Use log-scale on the geometric mean of dimensions to get an overall
-        # "ideal size", then distribute width/height by the actual aspect ratio.
-        # This prevents tall rows for wide images (the old approach applied log2
-        # independently to width and height, which made all images roughly square
-        # in ideal-space regardless of their actual aspect ratio).
-        raw_ideal = []
-        for img in images:
+        imgs = []
+        for i, img in enumerate(images):
             pw, ph = img.effective_width, img.effective_height
-            geo_mean = math.sqrt(pw * ph) if pw > 0 and ph > 0 else max(pw, ph, 1)
-            ideal_size = math.log2(geo_mean + 1)
-            aspect = pw / ph if ph > 0 else 1.0
-            # Distribute: iw * ih == ideal_size^2, iw/ih == aspect
-            ih = ideal_size / math.sqrt(aspect) if aspect > 0 else ideal_size
-            iw = ih * aspect
-            raw_ideal.append((iw, ih))
-
-        # Step 2: Quantize heights into row bins (from UNSCALED ideals for stability)
-        n_bins = self._bin_count(len(images))
-        bins = self._compute_bins([ih for _, ih in raw_ideal], n_bins)
-
-        # Step 3: Assign images to bins based on unscaled ideal heights.
-        # Per-image scale_step is carried through as a multiplier applied
-        # during packing, so it always produces a visible size change even
-        # when there's only one bin.
-        # groups: bin_h -> list of (ideal_w, image_index, per_image_factor)
-        groups: dict[float, list[tuple[float, int, float]]] = {}
-        for i, (iw, ih) in enumerate(raw_ideal):
-            step = getattr(images[i], 'scale_step', 0)
+            iw, ih = self._log_scale(pw, ph)
+            step = getattr(img, 'scale_step', 0)
             factor = 1.2 ** step if step != 0 else 1.0
-            best_bin = min(bins, key=lambda b: abs(b - ih))
-            scaled_w = iw * (best_bin / ih) if ih > 0 else iw
-            groups.setdefault(best_bin, []).append((scaled_w, i, factor))
+            imgs.append({'index': i, 'iw': iw, 'ih': ih, 'factor': factor})
 
-        # Step 4: Pack rows with scale-to-fit via binary search
-        return self._scale_to_fit(groups)
+        max_ih = max(max(im['ih'], im['iw']) for im in imgs)
 
-    def _bin_count(self, n: int) -> int:
-        """Choose number of height bins based on image count."""
+        # Step 2: Try multiple strategies, pick best
+        candidates = []
+
+        # Strategy A: Binned packing with multiple bin counts
+        ideal_heights = [im['ih'] for im in imgs]
+        all_heights = ideal_heights + [im['iw'] for im in imgs]
+        n = len(images)
+
         if n <= 2:
-            return 1
-        if n <= 5:
-            return 2
-        if n <= 10:
-            return 3
-        if n <= 20:
-            return 4
-        return 5
+            bin_range = [1, 2]
+        elif n <= 5:
+            bin_range = [1, 2, 3]
+        elif n <= 10:
+            bin_range = [2, 3, 4]
+        elif n <= 20:
+            bin_range = [3, 4, 5]
+        else:
+            bin_range = [3, 4, 5, 6]
 
-    def _compute_bins(self, heights: list[float], n_bins: int) -> list[float]:
-        """Split sorted heights into n_bins groups, return median of each."""
-        heights = sorted(heights)
-        if n_bins >= len(heights):
-            result = sorted(set(heights))
-            return result if result else [1.0]
+        for nb in bin_range:
+            for h_src in [ideal_heights, all_heights]:
+                bins = self._kmeans_1d(h_src, nb)
+                result = self._scale_to_fit(
+                    lambda s, _b=bins: self._pack_binned(imgs, _b, s),
+                    max_ih)
+                candidates.append(result)
 
-        group_size = len(heights) / n_bins
-        bins = []
-        for i in range(n_bins):
-            start = int(i * group_size)
-            end = int((i + 1) * group_size)
-            group = heights[start:end]
-            if group:
-                bins.append(group[len(group) // 2])
+        # Strategy B: Sorted shelves (with/without rotation)
+        for allow_rot in [True, False]:
+            result = self._scale_to_fit(
+                lambda s, _ar=allow_rot: self._pack_sorted_shelves(imgs, s, _ar),
+                max_ih)
+            candidates.append(result)
 
-        result = sorted(set(bins))
-        return result if result else [heights[len(heights) // 2]]
+        # Strategy C: Best-fit decreasing
+        result = self._scale_to_fit(
+            lambda s: self._pack_bestfit(imgs, s),
+            max_ih)
+        candidates.append(result)
 
-    def _scale_to_fit(self, groups: dict) -> LayoutResult:
-        """Binary search for the largest scale factor that fits the page."""
-        max_bin = max(groups.keys())
-        scale_hi = (self.ph * 0.6) / max_bin if max_bin > 0 else 100.0
-        scale_lo = 0.1
-
+        # Apply conservative row stretching and pick best
         best = None
-        for _ in range(40):
+        best_score = -1.0
+        for c in candidates:
+            if c and c.placements:
+                stretched = self._stretch_rows(c)
+                score = self._score(stretched)
+                if score > best_score:
+                    best_score = score
+                    best = stretched
+
+        return best or LayoutResult()
+
+    # --- Utility methods ---
+
+    @staticmethod
+    def _log_scale(pw: int, ph: int) -> tuple[float, float]:
+        """Convert pixel dimensions to ideal sizes via log-scale on geometric mean."""
+        geo_mean = math.sqrt(pw * ph) if pw > 0 and ph > 0 else max(pw, ph, 1)
+        ideal_size = math.log2(geo_mean + 1)
+        aspect = pw / ph if ph > 0 else 1.0
+        ih = ideal_size / math.sqrt(aspect) if aspect > 0 else ideal_size
+        iw = ih * aspect
+        return iw, ih
+
+    def _clamp(self, w: int, h: int) -> tuple[int, int]:
+        """Scale down proportionally if width exceeds page."""
+        if w > self.pw and w > 0:
+            ratio = self.pw / w
+            h = max(1, int(h * ratio))
+            w = self.pw
+        return w, h
+
+    @staticmethod
+    def _kmeans_1d(values: list[float], k: int, iterations: int = 20) -> list[float]:
+        """1D k-means clustering for bin heights."""
+        if k >= len(values):
+            result = sorted(set(values))
+            return result if result else [1.0]
+        sv = sorted(values)
+        step = len(sv) / (k + 1)
+        centers = [sv[min(int((i + 1) * step), len(sv) - 1)] for i in range(k)]
+        for _ in range(iterations):
+            clusters = [[] for _ in range(k)]
+            for v in sv:
+                best = min(range(k), key=lambda c: abs(v - centers[c]))
+                clusters[best].append(v)
+            centers = [
+                (sum(cl) / len(cl)) if cl else centers[i]
+                for i, cl in enumerate(clusters)
+            ]
+        return sorted(set(round(c, 6) for c in centers)) or [1.0]
+
+    def _scale_to_fit(self, pack_fn, max_ideal_h: float) -> LayoutResult:
+        """Binary search for largest scale that fits the page."""
+        scale_hi = (self.ph * 0.85) / max_ideal_h if max_ideal_h > 0 else 100.0
+        scale_lo = 0.1
+        best = None
+        for _ in range(50):
             mid = (scale_hi + scale_lo) / 2
-            result = self._try_pack(groups, mid)
+            result = pack_fn(mid)
             if result is not None:
                 best = result
                 scale_lo = mid
             else:
                 scale_hi = mid
-
         if best is None:
-            best = self._try_pack(groups, scale_lo) or LayoutResult()
+            best = pack_fn(scale_lo) or LayoutResult()
         return best
 
-    def _try_pack(self, groups: dict, scale: float) -> LayoutResult | None:
-        """Attempt to pack all images at the given scale. Returns None if overflow."""
+    def _build_rows(self, rows_data) -> LayoutResult:
+        """Convert raw row data to LayoutResult with absolute positions."""
+        layout_rows = []
+        y = self.margin
+        for rh, items in rows_data:
+            placements = [
+                PlacedImage(image_index=idx, x=self.margin + x, y=y,
+                            width=w, height=h, rotated=rot)
+                for x, w, h, idx, rot in items
+            ]
+            layout_rows.append(LayoutRow(y=y, height=rh, placements=placements))
+            y += rh + self.gap
+        return LayoutResult(rows=layout_rows)
+
+    def _fill_ratio(self, result: LayoutResult) -> float:
+        if not result.placements:
+            return 0.0
+        area = sum(p.width * p.height for p in result.placements)
+        return area / (self.pw * self.ph)
+
+    def _score(self, result: LayoutResult) -> float:
+        """Score combining fill ratio (80%) and street length (20%)."""
+        if not result.placements:
+            return 0.0
+        fr = self._fill_ratio(result)
+        # Estimate street quality: full-width horizontal streets
+        n_rows = len(result.rows)
+        h_streets = n_rows + 1
+        max_dim = max(self.pw, self.ph)
+        street_score = (h_streets * self.pw) / (max_dim * max(n_rows, 1))
+        return fr * 0.8 + min(street_score, 1.0) * 0.2
+
+    # --- Strategy A: Binned shelf packing ---
+
+    def _pack_binned(self, imgs: list[dict], bins: list[float],
+                     scale: float) -> LayoutResult | None:
+        """Binned shelf packing with rotation support."""
+        assigned = []
+        for im in imgs:
+            best_bin = None
+            best_sw = None
+            best_rot = False
+            best_dist = float('inf')
+
+            for b in bins:
+                # Normal orientation
+                dist_n = abs(b - im['ih'])
+                sw_n = im['iw'] * (b / im['ih']) if im['ih'] > 0 else im['iw']
+                # Rotated orientation
+                rot_ih = im['iw']
+                rot_iw = im['ih']
+                dist_r = abs(b - rot_ih)
+                sw_r = rot_iw * (b / rot_ih) if rot_ih > 0 else rot_iw
+
+                if dist_n <= dist_r:
+                    if dist_n < best_dist:
+                        best_dist, best_bin, best_sw, best_rot = dist_n, b, sw_n, False
+                else:
+                    if dist_r < best_dist:
+                        best_dist, best_bin, best_sw, best_rot = dist_r, b, sw_r, True
+
+            assigned.append((im['index'], best_sw, best_bin, im['factor'], best_rot))
+
+        assigned.sort(key=lambda t: (-t[2], -t[1] * t[3]))
+
         rows = []
+        cx = 0
+        current = []
+        current_h = 0
 
-        # Pack each bin's images into rows, largest bins first
-        for bin_h in sorted(groups.keys(), reverse=True):
-            row_h = max(1, int(bin_h * scale))
+        for idx, sw, bh, factor, rot in assigned:
+            w = max(1, int(sw * scale * factor))
+            h = max(1, int(bh * scale * factor))
+            w, h = self._clamp(w, h)
 
-            current: list[tuple[int, int, int, int]] = []  # (x, width, height, image_index)
-            cx = 0
-
-            for ideal_w, idx, img_factor in groups[bin_h]:
-                w = max(1, int(ideal_w * scale * img_factor))
-                h = max(1, int(bin_h * scale * img_factor))
-                if w > self.pw:
-                    w = self.pw
-
-                needed = cx + (self.gap if current else 0) + w
-                if needed > self.pw and current:
-                    # Row height = tallest image in the row
-                    actual_row_h = max(item_h for _, _, item_h, _ in current)
-                    rows.append((actual_row_h, current))
-                    current = []
-                    cx = 0
-
-                if current:
-                    cx += self.gap
-                current.append((cx, w, h, idx))
-                cx += w
+            needed = cx + (self.gap if current else 0) + w
+            if needed > self.pw and current:
+                rows.append((current_h, current))
+                current, cx, current_h = [], 0, 0
 
             if current:
-                actual_row_h = max(item_h for _, _, item_h, _ in current)
-                rows.append((actual_row_h, current))
+                cx += self.gap
+            current.append((cx, w, h, idx, rot))
+            cx += w
+            current_h = max(current_h, h)
 
-        # Check vertical fit
-        total = sum(h for h, _ in rows) + self.gap * max(0, len(rows) - 1)
+        if current:
+            rows.append((current_h, current))
+
+        total = sum(rh for rh, _ in rows) + self.gap * max(0, len(rows) - 1)
         if total > self.ph:
             return None
 
-        # Build final layout with absolute positions
-        layout_rows = []
-        y = self.margin
-        for row_h, items in rows:
-            placements = [
-                PlacedImage(image_index=idx, x=self.margin + x, y=y, width=w, height=h)
-                for x, w, h, idx in items
-            ]
-            layout_rows.append(LayoutRow(y=y, height=row_h, placements=placements))
-            y += row_h + self.gap
+        return self._build_rows(rows)
 
-        return LayoutResult(rows=layout_rows)
+    # --- Strategy B: Sorted decreasing height shelves ---
+
+    def _pack_sorted_shelves(self, imgs: list[dict], scale: float,
+                             allow_rotation: bool = True) -> LayoutResult | None:
+        items = []
+        for im in imgs:
+            if allow_rotation and im['iw'] > im['ih']:
+                items.append((im['index'], im['ih'], im['iw'], im['factor'], True))
+            else:
+                items.append((im['index'], im['iw'], im['ih'], im['factor'], False))
+
+        items.sort(key=lambda t: -t[2] * t[3])
+
+        rows = []
+        cx = 0
+        current = []
+        current_h = 0
+
+        for idx, iw, ih, factor, rot in items:
+            w = max(1, int(iw * scale * factor))
+            h = max(1, int(ih * scale * factor))
+            w, h = self._clamp(w, h)
+
+            needed = cx + (self.gap if current else 0) + w
+            if needed > self.pw and current:
+                rows.append((current_h, current))
+                current, cx, current_h = [], 0, 0
+
+            if current:
+                cx += self.gap
+            current.append((cx, w, h, idx, rot))
+            cx += w
+            current_h = max(current_h, h)
+
+        if current:
+            rows.append((current_h, current))
+
+        total = sum(rh for rh, _ in rows) + self.gap * max(0, len(rows) - 1)
+        if total > self.ph:
+            return None
+
+        return self._build_rows(rows)
+
+    # --- Strategy C: Best-fit decreasing ---
+
+    def _pack_bestfit(self, imgs: list[dict], scale: float) -> LayoutResult | None:
+        img_data = []
+        for im in imgs:
+            wn = max(1, int(im['iw'] * scale * im['factor']))
+            hn = max(1, int(im['ih'] * scale * im['factor']))
+            wr = max(1, int(im['ih'] * scale * im['factor']))
+            hr = max(1, int(im['iw'] * scale * im['factor']))
+            wn, hn = self._clamp(wn, hn)
+            wr, hr = self._clamp(wr, hr)
+            img_data.append({
+                'index': im['index'], 'factor': im['factor'],
+                'wn': wn, 'hn': hn, 'wr': wr, 'hr': hr,
+            })
+
+        order = sorted(range(len(img_data)),
+                        key=lambda i: -max(img_data[i]['hn'], img_data[i]['hr']))
+        placed = [False] * len(img_data)
+        rows = []
+
+        for start_idx in order:
+            if placed[start_idx]:
+                continue
+
+            d = img_data[start_idx]
+            if d['wn'] >= d['wr']:
+                rw, rh, rot = d['wn'], d['hn'], False
+            else:
+                rw, rh, rot = d['wr'], d['hr'], True
+
+            row_items = [(0, rw, rh, d['index'], rot)]
+            cx = rw
+            row_h = rh
+            placed[start_idx] = True
+
+            changed = True
+            while changed:
+                changed = False
+                remaining = self.pw - cx - self.gap
+                if remaining <= 0:
+                    break
+
+                best_j = -1
+                best_waste = remaining + 1
+                best_w = best_h = 0
+                best_rot = False
+
+                for j in range(len(img_data)):
+                    if placed[j]:
+                        continue
+                    dj = img_data[j]
+                    if dj['wn'] <= remaining and dj['hn'] <= row_h * 1.05:
+                        waste = remaining - dj['wn']
+                        if waste < best_waste:
+                            best_waste, best_j = waste, j
+                            best_w, best_h, best_rot = dj['wn'], dj['hn'], False
+                    if dj['wr'] <= remaining and dj['hr'] <= row_h * 1.05:
+                        waste = remaining - dj['wr']
+                        if waste < best_waste:
+                            best_waste, best_j = waste, j
+                            best_w, best_h, best_rot = dj['wr'], dj['hr'], True
+
+                if best_j >= 0:
+                    placed[best_j] = True
+                    cx += self.gap
+                    row_items.append((cx, best_w, best_h, img_data[best_j]['index'], best_rot))
+                    cx += best_w
+                    row_h = max(row_h, best_h)
+                    changed = True
+
+            rows.append((row_h, row_items))
+
+        total = sum(rh for rh, _ in rows) + self.gap * max(0, len(rows) - 1)
+        if total > self.ph:
+            return None
+
+        return self._build_rows(rows)
+
+    # --- Post-processing: stretch rows ---
+
+    def _stretch_rows(self, result: LayoutResult) -> LayoutResult:
+        """Proportionally stretch images in near-full rows to fill width."""
+        if not result.rows:
+            return result
+
+        new_rows = []
+        y = self.margin
+        for row in result.rows:
+            if not row.placements:
+                new_rows.append(LayoutRow(y=y, height=row.height, placements=[]))
+                y += row.height + self.gap
+                continue
+
+            n_imgs = len(row.placements)
+            total_w = sum(p.width for p in row.placements)
+            total_gaps = self.gap * max(0, n_imgs - 1)
+            available = self.pw - total_gaps
+
+            if total_w <= 0 or available <= 0:
+                new_rows.append(LayoutRow(y=y, height=row.height, placements=list(row.placements)))
+                y += row.height + self.gap
+                continue
+
+            sf = available / total_w
+            if sf > 1.08 or sf < 1.0:
+                # Only stretch near-full rows (within 8%)
+                new_placements = []
+                cx = 0
+                for p in row.placements:
+                    new_placements.append(PlacedImage(
+                        image_index=p.image_index, x=self.margin + cx, y=y,
+                        width=p.width, height=p.height, rotated=p.rotated))
+                    cx += p.width + self.gap
+                new_rows.append(LayoutRow(y=y, height=row.height, placements=new_placements))
+                y += row.height + self.gap
+                continue
+
+            new_placements = []
+            cx = 0
+            new_row_h = 0
+            for p in row.placements:
+                new_w = max(1, int(p.width * sf))
+                new_h = max(1, int(p.height * sf))
+                new_placements.append(PlacedImage(
+                    image_index=p.image_index, x=self.margin + cx, y=y,
+                    width=new_w, height=new_h, rotated=p.rotated))
+                cx += new_w + self.gap
+                new_row_h = max(new_row_h, new_h)
+
+            new_rows.append(LayoutRow(y=y, height=new_row_h, placements=new_placements))
+            y += new_row_h + self.gap
+
+        return LayoutResult(rows=new_rows)
 
 
 # === PageWidget: WYSIWYG page view ===
@@ -490,12 +750,26 @@ class PageWidget(QWidget):
             pix = self._get_pixmap(placed.image_index)
             img = self.project.images[placed.image_index]
             mask = getattr(img, 'mask', None)
+            rotated = getattr(placed, 'rotated', False)
+
+            # If rotated, rotate the pixmap 90° clockwise
+            if rotated:
+                from PySide6.QtGui import QTransform
+                pix = pix.transformed(QTransform().rotate(90))
+
             cell = QRectF(ox + placed.x * scale, oy + placed.y * scale,
                           placed.width * scale, placed.height * scale)
             if mask is not None:
                 mx, my, mw, mh = mask
-                source = QRectF(mx, my, mw, mh)
-                dest = self._fit_rect(cell, mw, mh)
+                if rotated:
+                    # Remap mask coords for 90° rotation
+                    orig_w = img.pixel_width
+                    source = QRectF(orig_w - my - mh, mx, mh, mw)
+                else:
+                    source = QRectF(mx, my, mw, mh)
+                sw = source.width()
+                sh = source.height()
+                dest = self._fit_rect(cell, sw, sh)
                 painter.drawPixmap(dest, pix, source)
             else:
                 dest = self._fit_rect(cell, pix.width(), pix.height())
@@ -1751,12 +2025,24 @@ class MainWindow(QMainWindow):
             img = self.project.images[placed.image_index]
             qimg = QImage()
             qimg.loadFromData(img.png_data)
+            rotated = getattr(placed, 'rotated', False)
+
+            if rotated:
+                from PySide6.QtGui import QTransform
+                qimg = qimg.transformed(QTransform().rotate(90))
+
             cell = QRectF(placed.x, placed.y, placed.width, placed.height)
             mask = getattr(img, 'mask', None)
             if mask is not None:
                 mx, my, mw, mh = mask
-                source = QRectF(mx, my, mw, mh)
-                dest = PageWidget._fit_rect(cell, mw, mh)
+                if rotated:
+                    orig_w = img.pixel_width
+                    source = QRectF(orig_w - my - mh, mx, mh, mw)
+                else:
+                    source = QRectF(mx, my, mw, mh)
+                sw = source.width()
+                sh = source.height()
+                dest = PageWidget._fit_rect(cell, sw, sh)
                 painter.drawImage(dest, qimg, source)
             else:
                 dest = PageWidget._fit_rect(cell, qimg.width(), qimg.height())
