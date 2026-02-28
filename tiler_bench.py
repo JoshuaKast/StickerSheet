@@ -5,16 +5,19 @@ Generates a set of randomly-sized images (plausible web dimensions), runs the
 Tiler, and prints a suite of quality metrics.  No Qt, no GUI — pure Python.
 
 Usage:
-    python tiler_bench.py              # default 20 images, random seed 42
-    python tiler_bench.py -n 30        # 30 images
-    python tiler_bench.py --seed 7     # reproducible with a different seed
-    python tiler_bench.py --verbose    # print per-image details
+    python tiler_bench.py                  # default 20 images, seed 42
+    python tiler_bench.py -n 30            # 30 images
+    python tiler_bench.py --seed 7         # reproducible with a different seed
+    python tiler_bench.py -v               # print per-image details
+    python tiler_bench.py --time-limit 2.0 # allow 2 seconds for optimisation
+    python tiler_bench.py --sweep          # run across multiple image counts
 """
 
 import argparse
 import math
 import random
 import sys
+import time
 
 from models import PageSettings, StickerImage, PlacedImage
 from tiler import Tiler
@@ -438,10 +441,11 @@ def check_overlaps(placements: list[PlacedImage]) -> list[tuple[int, int]]:
 # Main
 # ---------------------------------------------------------------------------
 
-def run_bench(n_images: int, seed: int, verbose: bool) -> bool:
+def run_bench(n_images: int, seed: int, verbose: bool,
+              time_limit: float = 1.0) -> bool:
     rng = random.Random(seed)
     settings = PageSettings()  # default US Letter
-    tiler = Tiler(settings)
+    tiler = Tiler(settings, time_limit=time_limit)
 
     images = generate_images(n_images, rng)
 
@@ -450,7 +454,9 @@ def run_bench(n_images: int, seed: int, verbose: bool) -> bool:
         print(f"  [{i:>2}] {img.pixel_width:>5} x {img.pixel_height:<5}  "
               f"AR={img.pixel_width / img.pixel_height:.2f}")
 
+    t0 = time.monotonic()
     result = tiler.layout(images)
+    elapsed = time.monotonic() - t0
 
     if not result.rows:
         print("\nERROR: Tiler returned empty layout.")
@@ -463,6 +469,8 @@ def run_bench(n_images: int, seed: int, verbose: bool) -> bool:
     else:
         print(f"\nNo overlaps detected.  (checked {len(result.placements)} placements)")
 
+    print(f"Layout time: {elapsed:.3f}s  (time_limit={time_limit:.1f}s)")
+
     metrics = TilerMetrics(images, settings, result)
     passed = metrics.print_report(verbose=verbose)
 
@@ -470,6 +478,54 @@ def run_bench(n_images: int, seed: int, verbose: bool) -> bool:
         passed = False
 
     return passed
+
+
+def run_sweep(seeds: list[int], counts: list[int], time_limit: float):
+    """Run a matrix of (image_count, seed) configs and print a summary table."""
+    settings = PageSettings()
+
+    print("=" * 90)
+    print("SWEEP BENCHMARK")
+    print("=" * 90)
+    print(f"{'n':>4}  {'seed':>4}  {'fill%':>6}  {'bbox%':>6}  "
+          f"{'med_st':>7}  {'ar_max':>7}  {'min_gap':>7}  "
+          f"{'time':>6}  {'status':>6}")
+    print("-" * 90)
+
+    all_pass = True
+    for n in counts:
+        for seed in seeds:
+            rng = random.Random(seed)
+            images = generate_images(n, rng)
+            tiler = Tiler(settings, time_limit=time_limit)
+
+            t0 = time.monotonic()
+            result = tiler.layout(images)
+            elapsed = time.monotonic() - t0
+
+            overlaps = check_overlaps(result.placements)
+            metrics = TilerMetrics(images, settings, result)
+
+            ar_ok = metrics.ar_max_error < 0.05
+            spacing_ok = metrics.min_gap >= settings.cut_gap
+            ok = ar_ok and spacing_ok and not overlaps
+
+            status = "OK" if ok else "FAIL"
+            if not ok:
+                all_pass = False
+
+            print(f"{n:>4}  {seed:>4}  "
+                  f"{metrics.fill_ratio_of_printable:>5.1%}  "
+                  f"{metrics.fill_ratio_of_bbox:>5.1%}  "
+                  f"{metrics.greedy_street_median:>6.0f}px  "
+                  f"{metrics.ar_max_error:>6.3%}  "
+                  f"{metrics.min_gap:>5}px  "
+                  f"{elapsed:>5.3f}s  {status:>6}")
+
+    print("-" * 90)
+    print(f"Overall: {'ALL PASS' if all_pass else 'SOME FAILED'}")
+    print("=" * 90)
+    return all_pass
 
 
 def main():
@@ -480,9 +536,21 @@ def main():
                         help="Random seed for reproducibility (default 42)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Print per-image details")
+    parser.add_argument("--time-limit", type=float, default=1.0,
+                        help="Time limit in seconds for tiler (default 1.0)")
+    parser.add_argument("--sweep", action="store_true",
+                        help="Run sweep across multiple image counts and seeds")
     args = parser.parse_args()
 
-    passed = run_bench(args.num_images, args.seed, args.verbose)
+    if args.sweep:
+        passed = run_sweep(
+            seeds=[42, 7, 123, 256, 999],
+            counts=[3, 5, 10, 20, 30, 50],
+            time_limit=args.time_limit,
+        )
+    else:
+        passed = run_bench(args.num_images, args.seed, args.verbose,
+                           time_limit=args.time_limit)
     sys.exit(0 if passed else 1)
 
 
