@@ -80,6 +80,7 @@ class TilerMetrics:
         # Precompute
         self._compute_area_metrics()
         self._compute_street_lengths()
+        self._compute_greedy_streets()
         self._compute_aspect_ratio_fidelity()
         self._compute_spacing()
 
@@ -148,6 +149,120 @@ class TilerMetrics:
         self.total_street_length = (
             self.horizontal_street_total_length + self.vertical_street_total_length
         )
+
+    # -- (b2) Greedy street cover (median street length) --------------------
+
+    def _compute_greedy_streets(self):
+        """Compute the greedy minimum-cut-set street metric.
+
+        Algorithm:
+        1. Enumerate all streets (horizontal between rows, vertical between
+           adjacent images within a row).
+        2. Sort by length descending.
+        3. Greedily select streets — skip any that overlap with an already-
+           selected street (intersections are OK) — until every tile adjoins
+           a selected street on all four sides.  Sides that face the page
+           margin are pre-covered (no cut needed along the page edge).
+        4. Report mean and median of the selected street lengths.
+
+        In a row-based layout no two candidate streets ever overlap (horizontal
+        streets differ in y; vertical streets within a row differ in x; vertical
+        streets across rows differ in y-range), so the overlap check is vacuous
+        and every candidate is eligible.
+        """
+        rows = self.result.rows
+        if not rows:
+            self.greedy_street_lengths: list[int] = []
+            self.greedy_street_mean = 0.0
+            self.greedy_street_median = 0.0
+            return
+
+        pw = self.settings.printable_width
+        sorted_rows = sorted(rows, key=lambda r: r.y)
+        n_rows = len(sorted_rows)
+
+        # Stable sorted placements per row
+        row_placements = [
+            sorted(row.placements, key=lambda p: p.x) for row in sorted_rows
+        ]
+
+        # --- Enumerate candidate streets ---
+        # (length, kind, key)
+        #   kind='h', key=k        → between sorted_rows[k] and [k+1]
+        #   kind='v', key=(r, p)   → between placements p and p+1 in row r
+        streets: list[tuple[int, str, object]] = []
+
+        for k in range(n_rows - 1):
+            streets.append((pw, 'h', k))
+
+        for r_idx, sp in enumerate(row_placements):
+            row_h = sorted_rows[r_idx].height
+            for p_idx in range(len(sp) - 1):
+                streets.append((row_h, 'v', (r_idx, p_idx)))
+
+        # Longest first
+        streets.sort(key=lambda s: s[0], reverse=True)
+
+        # --- Coverage tracking ---
+        # For each tile (r_idx, p_idx), track which internal sides still need
+        # a street.  Sides adjacent to the page margin are pre-covered.
+        needs: dict[tuple[int, int], set[str]] = {}
+
+        for r_idx, sp in enumerate(row_placements):
+            for p_idx in range(len(sp)):
+                uncovered: set[str] = set()
+                if r_idx > 0:
+                    uncovered.add('top')
+                if r_idx < n_rows - 1:
+                    uncovered.add('bottom')
+                if p_idx > 0:
+                    uncovered.add('left')
+                if p_idx < len(sp) - 1:
+                    uncovered.add('right')
+                if uncovered:
+                    needs[(r_idx, p_idx)] = uncovered
+
+        # --- Greedy selection ---
+        selected: list[int] = []
+
+        for length, kind, key in streets:
+            if not needs:
+                break  # all tiles fully covered
+
+            # Determine which tile-sides this street covers
+            covers: list[tuple[tuple[int, int], str]] = []
+            if kind == 'h':
+                k = key
+                for p_idx in range(len(row_placements[k])):
+                    covers.append(((k, p_idx), 'bottom'))
+                for p_idx in range(len(row_placements[k + 1])):
+                    covers.append(((k + 1, p_idx), 'top'))
+            else:  # 'v'
+                r_idx, p_idx = key
+                covers.append(((r_idx, p_idx), 'right'))
+                covers.append(((r_idx, p_idx + 1), 'left'))
+
+            selected.append(length)
+
+            for tile_id, side in covers:
+                if tile_id in needs:
+                    needs[tile_id].discard(side)
+                    if not needs[tile_id]:
+                        del needs[tile_id]
+
+        self.greedy_street_lengths = selected
+
+        if selected:
+            self.greedy_street_mean = sum(selected) / len(selected)
+            s = sorted(selected)
+            n = len(s)
+            if n % 2 == 1:
+                self.greedy_street_median = float(s[n // 2])
+            else:
+                self.greedy_street_median = (s[n // 2 - 1] + s[n // 2]) / 2.0
+        else:
+            self.greedy_street_mean = 0.0
+            self.greedy_street_median = 0.0
 
     # -- (c) Aspect-ratio fidelity ------------------------------------------
 
@@ -244,6 +359,19 @@ class TilerMetrics:
               f"({self.vertical_street_total_length / dpi:.1f} in)")
         print(f"  Total street length:        {self.total_street_length:>8,} px  "
               f"({self.total_street_length / dpi:.1f} in)")
+
+        # (b2) Greedy street cover
+        print(f"\n--- (b2) Median street length (greedy cover) ---")
+        print(f"  Streets selected:        {len(self.greedy_street_lengths):>4}")
+        print(f"  Mean length:           {self.greedy_street_mean:>8.0f} px  "
+              f"({self.greedy_street_mean / dpi:.2f} in)")
+        print(f"  Median length:         {self.greedy_street_median:>8.0f} px  "
+              f"({self.greedy_street_median / dpi:.2f} in)")
+
+        if verbose and self.greedy_street_lengths:
+            print(f"\n  Selected streets (longest first):")
+            for i, length in enumerate(self.greedy_street_lengths):
+                print(f"    [{i + 1:>2}]  {length:>6} px  ({length / dpi:.2f} in)")
 
         # (c) Aspect ratio
         print(f"\n--- (c) Aspect-ratio fidelity ---")
